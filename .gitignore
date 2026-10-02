@@ -4,3 +4,6 @@ obj/
 *.d
 *.bak
 traces/
+
+# stray output folder some editors/apps drop into the repo
+Claude outputs/

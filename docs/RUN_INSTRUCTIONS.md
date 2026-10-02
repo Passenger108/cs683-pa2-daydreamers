@@ -241,8 +241,12 @@ simulations ran in Docker — it only reads the CSV.
 
 ## 6. Fill in the write-up
 
-`docs/TASK1_SPP.md` is complete except for §8, where every results cell says `TBD`.
-Copy the numbers from `results/task1/task1.csv` into:
+**This is already done** — `docs/TASK1_SPP.md` §8 carries the real GCC 7 numbers,
+and `Summary.pdf` at the repo root is built from it. What follows is how to
+*regenerate* it after Tasks 2 and 3 add their own results.
+
+`scripts/parse_results.py` writes `results/task1/task1_tables.md`, which is §8.1–§8.6
+already formatted — paste it over the corresponding block. The sections are:
 
 * §8.1 IPC and speedup
 * §8.2 L1D load MPKI
