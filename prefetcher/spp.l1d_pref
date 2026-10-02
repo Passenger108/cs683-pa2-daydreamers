@@ -63,9 +63,10 @@
 // which destroys a stride history before it can ever be used.
 #define IP_TABLE_SETS         64
 #define IP_TABLE_WAYS         4
+#define IP_INDEX_BITS         6       // log2(IP_TABLE_SETS) - keep these two in step
 #define IP_TABLE_ENTRIES      (IP_TABLE_SETS * IP_TABLE_WAYS)
 #define IP_INDEX(ip)          ((uint32_t)((ip) & (IP_TABLE_SETS - 1)))
-#define IP_TAG(ip)            ((uint16_t)(((ip) >> 6) & 0xFFFF))
+#define IP_TAG(ip)            ((uint16_t)(((ip) >> IP_INDEX_BITS) & 0xFFFF))
 
 #define SIG_BITS              10      // 10-bit signature
 #define PATTERN_ENTRIES       (1 << SIG_BITS)
