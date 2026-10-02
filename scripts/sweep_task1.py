@@ -141,13 +141,17 @@ def storage_bytes(v):
             if x.isdigit():
                 max_deg = max(max_deg, int(x))
 
+    win = v["defines"].get("ACC_WINDOW", 256)
     lru_bits = max(0, (ways - 1).bit_length())        # 1->0, 2->1, 4->2, 8->3
     uconf_bits = max(1, uconf_max.bit_length())       # 3->2, 4->3
     ip_bits = 16 + 1 + 12 + 6 + 7 + uconf_bits + 10 + lru_bits
     ip_total = sets * ways * ip_bits
 
     pattern_total = 1024 * 9                          # 7b signed stride + 2b confidence
-    throttle_bits = max(1, max_deg.bit_length()) + 12 + 12
+    # the two window counters only have to span ACC_WINDOW plus the <=32 prefetches
+    # that can still be in flight when the window closes
+    ctr_bits = max(1, (win + 32).bit_length())
+    throttle_bits = max(1, max_deg.bit_length()) + 2 * ctr_bits
     return (ip_total + pattern_total + throttle_bits + 7) // 8
 
 
