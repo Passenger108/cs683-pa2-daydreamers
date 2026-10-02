@@ -7,3 +7,5 @@ traces/
 
 # stray output folder some editors/apps drop into the repo
 Claude outputs/
+__pycache__/
+*.pyc
