@@ -207,7 +207,7 @@ It computes, per the PDF's definitions:
 It reports accuracy as the field ChampSim literally labels `ACCURACY`
 (`pf_useful / pf_lower_level` — useful lines over lines *actually fetched*), which is what
 the PDF means by "also present in stats"; the coarser `useful / issued` ratio is carried
-alongside it. The reasoning is in `docs/TASK1_SPP.md` §7.1.
+alongside it. The reasoning is in `docs/TASK1_SPP.md` §6.1.
 
 It also **refuses to produce results that fail its own checks** and exits non-zero if any
 run did not simulate 25M+25M, if any prefetcher emitted a cross-page prefetch, or if the
@@ -241,7 +241,7 @@ simulations ran in Docker — it only reads the CSV.
 
 ## 6. Fill in the write-up
 
-**This is already done** — `docs/TASK1_SPP.md` §8 carries the real GCC 7 numbers,
+**This is already done** — `docs/TASK1_SPP.md` §8 carries the results,
 and `Summary.pdf` at the repo root is built from it. What follows is how to
 *regenerate* it after Tasks 2 and 3 add their own results.
 
@@ -266,18 +266,24 @@ into your editor of choice and add the four PNGs).
 
 ---
 
-## 7. Optional experiments that would strengthen the report
+## 7. The design sweep (already done — here is how to re-run it)
+
+All of these have been run: `python3 scripts/sweep_task1.py ../traces 3` builds 15 variants
+and runs each on all three traces at 25M+25M, writing `results/task1_sweep/` and
+`sweep_summary.md`. Results and analysis are in `docs/TASK1_SPP.md` §9.
+
+The table below is kept as the record of what each experiment was for.
+
+### Further experiments not yet run
 
 Each is a one-line edit to `prefetcher/spp.l1d_pref`, a rebuild, and one run.
 
 | Question | Edit | Why it helps |
 |---|---|---|
-| Was degree 4 the right cap? | `MAX_DEGREE` → 2, 3, 6 and the mapping in the throttle block | Turns §7.2's argument into measured data |
+| Was degree 4 the right cap? | `MAX_DEGREE` → 2, 3, 6 and the mapping in the throttle block | done — §9.2 |
 | Does throttling earn its keep? | make all four branches assign the same constant (fixed degree) | Isolates the throttle's contribution; expect it to *lose* slightly on easy traces and win on hard ones |
-| Is the IP table big enough at 25M? | `IP_TABLE_SETS` / `IP_TABLE_WAYS` | I chose 64×4 from a 1M-instruction sweep; confirm the knee is in the same place at 25M |
-| Is the uniform threshold of 3 best in practice? | `UNIFORM_CONF_MAX` → 2 | §3.2 proves 3 is required for the PDF's example; measuring 2 shows what mis-classification costs |
-| Should stores train it? | `if (type != LOAD && type != RFO) return;` | Tests the §2.3 choice directly |
-| Is the throttle window right? | `ACC_WINDOW` → 256, 1024 | §7.1 picks 512 from a bias-vs-adaptivity argument; ≈130 updates per 25M run is the coarsest part of the design |
+| Is a *finer* throttle window better still? | `ACC_WINDOW` → 128, 64 | the 256/512/1024 sweep was monotone in favour of smaller, so the optimum may be below 256 (§9.3) |
+| Would training on stores help? | `if (type != LOAD && type != RFO) return;` | tests the §3.3 choice, which is the one design decision still argued rather than measured |
 
 Also re-runnable any time, no simulation needed — the offline design check:
 

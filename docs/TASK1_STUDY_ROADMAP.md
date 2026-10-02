@@ -135,7 +135,7 @@ class definitions.
 **Do**
 
 Draw the two tables on paper with their field widths. Add up the bits per entry yourself
-and check you get 56 and 9. Then check your totals against `docs/TASK1_SPP.md` §6.
+and check you get 56 and 9. Then check your totals against `docs/TASK1_SPP.md` §7.
 
 **You've got it when** you can answer: *why is the stride field exactly 7 bits?*
 
@@ -150,7 +150,7 @@ and check you get 56 and 9. Then check your totals against `docs/TASK1_SPP.md` �
 
 **Read**
 
-`spp.l1d_pref` section (2) of `l1d_prefetcher_operate`, and `docs/TASK1_SPP.md` §2.2.
+`spp.l1d_pref` section (2) of `l1d_prefetcher_operate`, and `docs/TASK1_SPP.md` §3.2.
 
 **Do**
 
@@ -175,7 +175,7 @@ satisfies at once.
 
 **Read**
 
-`docs/TASK1_SPP.md` §4, then `spp_update_signature` and `spp_train_pattern` in the code.
+`docs/TASK1_SPP.md` §4.5, then `spp_update_signature` and `spp_train_pattern` in the code.
 
 **Do**
 
@@ -183,7 +183,7 @@ satisfies at once.
 python3 scripts/verify_design.py
 ```
 
-Read the output next to §4.3. Then by hand, starting from `sig = 0`, apply
+Read the output next to §4.5. Then by hand, starting from `sig = 0`, apply
 `sig = ((sig << 3) ^ (stride & 0x7F)) & 0x3FF` for strides `1, 2, 2, 2, 3` and check you
 reproduce one of the five signatures the script prints.
 
@@ -222,11 +222,11 @@ out.
 
 ---
 
-## Chunk 9 — The throttle, and the mistake worth knowing (30 min)
+## Chunk 9 — The throttle and its metric (30 min)
 
 **Read**
 
-`docs/TASK1_SPP.md` §7.1 — including the part about the metric I got wrong first.
+`docs/TASK1_SPP.md` §6.1 — how the usefulness metric is defined and why.
 
 **Do**
 
@@ -261,7 +261,7 @@ Also be ready for: *why is the degree floor 1 and not 0?*
 
 **Read**
 
-`docs/TASK1_SPP.md` §8 and §8.7, with `results/task1/task1_tables.md` open beside it.
+`docs/TASK1_SPP.md` §8 and §8.8, with `results/task1/task1_tables.md` open beside it.
 
 **Do**
 
@@ -283,10 +283,11 @@ Answer these from the tables:
 >    the chain breaks the moment a link drops below that. `chains cut by conf` (219 K–439 K
 >    per run) counts the times it had degree budget left and chose not to use it.
 > 3. trace2's **IP-table hit rate of 43.43 %** — more than half of its loads land on an
->    entry belonging to a different instruction. The fix is a bigger IP table
->    (`IP_TABLE_SETS` / `IP_TABLE_WAYS`). Note trace2 has the *highest* mean windowed
->    usefulness (67.20 %), so the prediction logic is fine — it just doesn't get to keep
->    histories.
+>    entry belonging to a different instruction. But the limit is **not** table size:
+>    going to 128×8 raises that hit rate to 59.85 % for 2.9× the storage and removes 352
+>    misses out of 325 007 (0.1 %). trace2's address stream simply has less stride
+>    structure to find — only 18.18 % of its prefetches come from the uniform path, the
+>    lowest of the three. See `docs/TASK1_SPP.md` §8.8.
 > 4. An L1D prefetch hit saves an L2 access (~10 cycles), not a DRAM round trip, and the
 >    baseline L1D hit rate is already ~94 %. trace3 proves the mechanism: lowest baseline
 >    MPKI (3.403) but the largest speedup (1.0225), because its remaining misses are the
@@ -316,8 +317,8 @@ If you only remember five things, make them these.
 
 The three places to look, in order:
 
-1. `docs/TASK1_SPP.md` §10 — the consistency audit. It is a closed list of every pair of
+1. `docs/TASK1_SPP.md` §11 — the design-interaction audit. It is a closed list of every pair of
    requirements that could conflict, and how each was resolved. Most "but doesn't X break
    Y?" questions are already a row in that table.
-2. `docs/TASK1_SPP.md` §6 — storage. Any "how much does it cost" question.
+2. `docs/TASK1_SPP.md` §7 — storage. Any "how much does it cost" question.
 3. `results/task1/task1_tables.md` — any "how do you know" question.

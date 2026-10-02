@@ -90,7 +90,7 @@
 // Accuracy based throttling.
 #define MAX_DEGREE            4
 #define MIN_DEGREE            1
-#define ACC_WINDOW            512     // re-evaluate every 512 lines actually fetched
+#define ACC_WINDOW            256     // re-evaluate every 256 lines actually fetched
 
 
 // --------------------------- the two tables --------------------------------

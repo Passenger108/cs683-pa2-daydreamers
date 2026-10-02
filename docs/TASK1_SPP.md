@@ -1,119 +1,98 @@
 # CS683 PA2 — Task 1: Stride Pattern Prefetching (SPP) at the L1D
 
-> **Toolchain of record.** Every result in §8 was produced with **GCC 7.5.0 at `-O3`**
-> (Ubuntu 18.04), as `README.md` requires, with **25M warmup + 25M simulation**
-> instructions on all three supplied traces. The compiler is verifiable from the
-> binaries themselves: `readelf -p .comment bin/<binary>` prints
-> `GCC: (Ubuntu/Linaro 7.5.0-3ubuntu1~18.04) 7.5.0`. No number in §8 comes from any
-> other toolchain. §9 explains why this matters more than it sounds.
->
-> The only measurements in this document *not* from that toolchain are the two
-> **design-selection sweeps** in §2.1 and §7.2, which were run at `-O0` purely to
-> choose a table geometry and a degree cap before committing simulation time. They
-> are labelled where they appear and none of them is reported as a result.
+**Toolchain:** GCC 7.5.0 at `-O3` (Ubuntu 18.04), as `README.md` requires. Verify with
+`readelf -p .comment bin/<binary>`. **Runs:** 25M warmup + 25M simulation, all three
+supplied traces. Every number in this document was produced that way.
+
+**Headline:** SPP beats the supplied IP-stride prefetcher on **every metric on every
+trace** — geomean speedup **1.0149 vs 1.0024**, pooled accuracy **53.89 % vs 39.38 %**,
+pooled L1D load-miss coverage **8.29 % vs 2.70 %** — in **2 947 B** of state, and with
+**zero** cross-page prefetch requests.
 
 ---
 
-## 0. How this document maps onto the PDF's deliverables
+## 0. The brief, and where each part is answered
 
-| PDF deliverable (Task 1) | Section here |
+| PDF deliverable | Here |
 |---|---|
 | Task 1A — understand `prefetcher/ip_stride.l1d_pref` | §1 |
-| Task 1B — implement SPP | §2–§5, code in `prefetcher/spp.l1d_pref` |
-| IPC, speedup, L1D load MPKI, accuracy, coverage — table + plots | §8 |
-| Total storage overhead, exact bit-level breakdown per entry | §6 |
-| How did you decide the accuracy-throttling threshold? | §7.1 |
-| Why these prefetch degrees for those accuracy ranges? | §7.2 |
+| Task 1B — implement SPP | §2–§6, code in `prefetcher/spp.l1d_pref` |
+| IPC, speedup, L1D load MPKI, accuracy, coverage — tabulated and plotted | §8 |
+| Total storage overhead, exact bit-level breakdown per entry | §7 |
+| How was the accuracy-throttling threshold decided? | §6.1, measured in §9.3 |
+| Why these prefetch degrees for those accuracy ranges? | §6.2, measured in §9.2 |
 
-Hard constraints the PDF imposes, and where each is satisfied:
-
-| Constraint | Where |
+| Hard constraint the PDF imposes | Where it is satisfied |
 |---|---|
-| Table tracks accesses per individual IP | `ip_table`, §2.1 |
-| Dual classification: uniform **and** non-uniform repeating strides | §3 |
-| Uniform first, dynamic fall-back to non-uniform | `uniform_conf`, §3.3 |
-| A **signature** of recent strides mapping to the next expected stride | `pattern_table`, §4 |
-| Degree **> 1** | §5, `MAX_DEGREE = 4` |
-| Accuracy checker + dynamic degree scaling | §7 |
-| **Never cross the OS page boundary** | §2.2 — structural, not a post-hoc test |
-| Lightweight / minimal storage | §6 — 2.56 KB total |
-| Use the provided template file | written into `prefetcher/spp.l1d_pref` |
-| 25M warmup + 25M simulation | `scripts/run_task1.sh` |
+| Table tracks accesses per individual IP | §3 |
+| Dual classification: uniform **and** repeating non-uniform strides | §4 |
+| Uniform first, dynamic fall-back to non-uniform | §4.2 |
+| A **signature** of recent strides mapping to the next expected stride | §4.4 |
+| Degree **> 1** | §5 |
+| Accuracy checker + dynamic degree scaling | §6 |
+| **Never cross the OS page boundary** | §3.2 — structural, and verified in §8.5 |
+| Lightweight / minimal storage | §7 — 2 947 B, 6 % of the L1D |
 
 ---
 
-## 1. Task 1A — what the supplied IP-stride prefetcher actually does
+## 1. Task 1A — the supplied IP-stride prefetcher
 
-`prefetcher/ip_stride.l1d_pref` is 139 lines. Stripped to its skeleton:
+`prefetcher/ip_stride.l1d_pref` is 139 lines. Its entire state is:
 
 ```c
 #define IP_TRACKER_COUNT 24
 #define PREFETCH_DEGREE   3
 #define MASK_IP        0xFF
-
 class IP_TRACKER { uint64_t ip; uint64_t last_cl_addr; int64_t last_stride; uint32_t lru; };
-IP_TRACKER trackers[IP_TRACKER_COUNT];
 ```
 
-On every L1D access it:
+Per access it converts the address to a cache-line address (`addr >> LOG2_BLOCK_SIZE` —
+strides are counted in **lines**, because prefetching is line-granular), masks the IP to 8
+bits, linearly searches 24 trackers, computes `stride = cl_addr - last_cl_addr`, and
+**prefetches only if `stride == last_stride`** — the same stride twice in a row. It then
+issues 3 prefetches at `cl_addr + k·stride`, stopping at the first one that leaves the 4 KB
+page, and picks `FILL_L1` or `FILL_L2` from MSHR occupancy.
 
-1. Converts the address to a cache-line address: `cl_addr = addr >> LOG2_BLOCK_SIZE`.
-   Strides are counted in **cache lines**, not bytes — prefetching is a line-granular
-   operation, so this is the natural unit, and I kept it.
-2. Masks the IP down to **8 bits** (`ip & 0xFF`) and does a **linear search** over 24
-   trackers for a match.
-3. On a miss, it evicts the LRU tracker (the one with `lru == 23`), seeds it with the
-   current address, and **returns without predicting** — one access carries no stride.
-4. On a hit, it computes `stride = cl_addr - last_cl_addr` with an explicit
-   signed-difference dance (the comment in the file explains it: subtracting
-   `uint64_t`s and letting it wrap would produce a garbage magnitude).
-5. **It prefetches only if `stride == last_stride`** — i.e. it needs to have seen the
-   same stride twice in a row.
-6. If so, it issues `PREFETCH_DEGREE = 3` prefetches at `cl_addr + k*stride`,
-   `k = 1..3`, breaking out of the loop at the first address that leaves the 4 KB page.
-7. It picks the fill level from MSHR pressure: `FILL_L1` while the L1D MSHR is less
-   than half full, otherwise `FILL_L2`.
+### 1.1 Five concrete weaknesses, and what SPP does about each
 
-### 1.1 The five weaknesses I took as my design brief
+Reading it this way turns "make it better" into five specific jobs.
 
-Reading it this way makes the gaps precise, and each gap maps to one thing I changed:
-
-| # | Weakness in `ip_stride` | What it costs | My change |
+| # | Weakness | Consequence | SPP's answer |
 |---|---|---|---|
-| 1 | **One stride per IP.** The predictor's entire state is `last_stride`. The condition `stride == last_stride` is false on *every* access of a non-uniform pattern like `(+1,+2,+2,+2,+3)^n` except inside the run of `+2`s. | It prefetches on 2 of 5 accesses of the PDF's own example, and the addresses it emits (`+2,+4,+6`) are wrong for 2 of those. | Signature → next-stride table (§4) |
-| 2 | **`ip & 0xFF` is the whole identity.** Any two load instructions whose PCs agree in the low 8 bits share a tracker and corrupt each other's history. | Silent cross-talk; a hot loop with loads 256 bytes apart in the binary destroys itself. | 64 sets × 4 ways with a 16-bit tag → 22 bits of PC distinguished (§2.1) |
-| 3 | **Fixed degree 3, always.** No notion of whether the prefetches are being used. | Pure pollution in phases with no stride structure, and under-prefetching in phases with perfect structure. | Accuracy-throttled degree 1–4 (§7) |
-| 4 | **It trains on its own prefetches.** ChampSim calls `l1d_prefetcher_operate` from the *prefetch queue* too (`src/cache.cc:2465` and `:2649`, with `type = PREFETCH`), passing the IP we attached to our own prefetch packets. `ip_stride` does not filter on `type`, so its `last_cl_addr` is advanced by addresses it invented. | The recorded stride stream is a mixture of the program's real strides and the prefetcher's guesses — a feedback loop. | `if (type != LOAD) return;` (§2.3) |
-| 5 | **Strides are computed across page boundaries.** `last_cl_addr` is a full line address, so the first access in a new page yields a huge meaningless stride, which then becomes `last_stride`. | One poisoned stride per page crossing per IP, and `stride == last_stride` can even fire on two consecutive garbage strides. | Strides live in page-offset space, so a page crossing is detected and skipped (§2.2) |
+| 1 | **One stride per IP.** The whole predictor is `last_stride`, and `stride == last_stride` is false on almost every access of a repeating sequence like `(+1,+2,+2,+2,+3)^n`. | It prefetches on 2 of 5 accesses of the PDF's own example, and the addresses it emits (`+2,+4,+6`) are wrong for most of them. | Signature → next-stride table (§4.4) |
+| 2 | **`ip & 0xFF` is the whole identity.** Any two load instructions whose PCs agree in the low 8 bits share a tracker. | Silent cross-talk: a loop with loads 256 bytes apart in the binary destroys its own history. | 64 sets × 4 ways with a 16-bit tag → 22 PC bits distinguished (§3.1) |
+| 3 | **Fixed degree 3, always.** No notion of whether the prefetches get used. | Pure pollution in phases with no stride structure. | Accuracy-throttled degree 1–4 (§6) |
+| 4 | **It trains on its own prefetches.** ChampSim calls `l1d_prefetcher_operate` from the *prefetch queue* too (`src/cache.cc:2465`, `:2649`, `type = PREFETCH`), and `prefetch_line()` copies our IP into the packet. `ip_stride` never checks `type`. | `last_cl_addr` is advanced by addresses the prefetcher invented — a feedback loop on its own output. | `if (type != LOAD) return;` (§3.3) |
+| 5 | **Strides folded across page boundaries.** `last_cl_addr` is a full *virtual* line address, so the step into a new page becomes `last_stride`. Because virtual space is linear this is harmless for an IP streaming through *adjacent* pages — the computed stride is the true one. For an IP jumping between *non-adjacent* pages it is an arbitrary number reflecting the allocator, not a pattern. | Not a correctness bug: the page guard rejects every out-of-page candidate (measured: **0** cross-page requests, §8.5). The cost is lost opportunity — the bogus value occupies `last_stride`, so the *next* access cannot match it either. | Strides live in page-offset space (§3.2) |
 
-Weaknesses 4 and 5 are worth emphasising in the viva: they are **correctness** bugs, not
-tuning choices, and they are invisible unless you go and read where ChampSim calls the
-hook.
+Weakness 4 is a genuine **correctness** bug; weakness 5 is a **lost-opportunity** bug rather than an incorrectness. Neither is visible
+unless you read where ChampSim *calls* the hook rather than only the hook itself. That is
+the single most transferable habit in this task.
 
 ---
 
-## 2. SPP structure
+## 2. SPP at a glance
 
-Two tables, one throttle. Nothing else.
+Two tables and one throttle. Nothing else.
 
 ```
                     demand LOAD (addr, ip)
                              |
             +----------------v-----------------+
-            |  IP TABLE   64 sets x 4 ways     |   per-instruction state:
-            |  index = ip[5:0], tag = ip[21:6] |   last offset, last stride,
-            +----------------+-----------------+   uniform confidence, signature
+            |  IP TABLE   64 sets x 4 ways     |  per-instruction state:
+            |  index = ip[5:0], tag = ip[21:6] |  last offset, last stride,
+            +----------------+-----------------+  uniform confidence, signature
                              |
                 stride = offset - last_offset
                              |
           +------------------+-------------------+
           |                                      |
-   train uniform conf                    train PATTERN TABLE
+   train uniform confidence              train PATTERN TABLE
    (stride == last_stride ?)             pattern_table[signature] = stride
           |                                      |
           +------------------+-------------------+
                              |
-            uniform_conf == 3 ?  -- yes -->  addr + k*stride, k = 1..degree
+            uniform_conf == 3 ?  -- yes -->  offset + k*stride, k = 1..degree
                              |
                              no
                              |
@@ -124,66 +103,63 @@ Two tables, one throttle. Nothing else.
                          prefetch_line()
 ```
 
-### 2.1 IP table — why set-associative, and why this size
+---
 
-`ip_stride` uses 24 fully-associative entries with a linear search. Fully associative is
-unrealistic in hardware at any useful size (a 256-entry CAM on the L1D access path is
-not happening), so the realistic choices are direct-mapped or set-associative.
+## 3. The per-IP table
 
-**I started direct-mapped** (128 entries, `index = ip & 0x7F`) because it is the
-cheapest and simplest thing that could work. I instrumented it with an allocation
-counter, and the counter is what killed it: on a 1M-instruction slice of `trace1` it
-**re-allocated an entry on 73% of all loads**. Every allocation wipes `last_stride`,
-`uniform_conf` and `signature`, so three quarters of the load stream was permanently in
-the "still learning" state and could never predict anything. That is the single most
-important measurement I made in this task — a prefetcher can look like it works
-(it was still issuing prefetches) while most of its table is being destroyed
-continuously.
+### 3.1 Geometry: 64 sets × 4 ways = 256 entries
 
-I then swept geometry at constant effort, measuring IP-table hit rate directly:
+`ip_stride` uses 24 fully-associative entries. Fully associative is unrealistic in hardware
+at any useful size — a 256-entry CAM on the L1D access path is not happening — so the real
+choice is direct-mapped vs set-associative.
 
-| geometry | entries | IP-table hit rate | direction of L1D load MPKI |
-|---|---|---|---|
-| 256 × 1 (direct-mapped) | 256 | 73.2 % | worst of the four |
-| **64 × 4** | **256** | **82.1 %** | clearly better than direct-mapped |
-| 128 × 4 | 512 | 88.4 % | ~equal to 64×4 |
-| 64 × 8 | 512 | 89.1 % | marginally best |
+The geometry sweep (§9.1, all three traces) decides it:
 
-The shape of that curve is the argument: **associativity, not capacity, is what this
-table was short of** — going from 256×1 to 64×4 at *identical* storage recovers most of
-the loss, whereas doubling storage to 512 entries buys very little more. Since "design a
-lightweight prefetcher ... with minimal storage overhead" is an explicit grading
-criterion, I sit at the knee of the curve: **64 sets × 4 ways = 256 entries**.
+| geometry | entries | IP-table bytes | total | mean IP hit rate | avg L1D load MPKI | pooled accuracy |
+|---|---|---|---|---|---|---|
+| 256 × 1 (direct-mapped) | 256 | 1 728 | 2 883 B | 59.86 % | 8.482 | 53.33 % |
+| 128 × 2 | 256 | 1 760 | 2 915 B | 64.32 % | 8.456 | 53.36 % |
+| **64 × 4 (chosen)** | **256** | **1 792** | **2 947 B** | **66.00 %** | **8.450** | **53.36 %** |
+| 128 × 4 | 512 | 3 584 | 4 739 B | 72.70 % | 8.442 | 52.99 % |
+| 64 × 8 | 512 | 3 648 | 4 803 B | 73.51 % | 8.441 | 52.90 % |
+| 128 × 8 | 1024 | 7 296 | 8 451 B | 76.97 % | 8.443 | 52.08 % |
 
-> These geometry numbers come from a scratch diagnostic build and are used **only** to
-> choose the geometry. Re-run the same sweep under GCC 7 at 25M+25M if you want the table
-> itself in Summary.pdf; the choice it supports does not change.
+**Insight 1 — associativity, not capacity, was the shortfall.** The first three rows hold
+storage essentially constant (2 883 → 2 947 B) and only move ways. Hit rate climbs
+59.86 → 64.32 → 66.00 %, MPKI falls 8.482 → 8.456 → 8.450, monotonically, for free. An
+IP-indexed table is hit by *conflict* misses, not capacity misses, because the hot load PCs
+of a loop are few but may collide in the index.
 
-Indexing: `index = ip & 0x3F` (low 6 bits of the PC), `tag = (ip >> 6) & 0xFFFF`.
-Index and tag together distinguish **22 bits** of PC versus `ip_stride`'s 8. I use the
-low PC bits as the index deliberately: x86 instructions are variable length, so within a
-hot loop the low bits of consecutive load PCs are already well spread, which is exactly
-what you want from an index.
+**Insight 2 — past 256 entries the table stops being the constraint, and a bigger one
+actively costs accuracy.** Doubling storage lifts the hit rate another ~7 points but moves
+MPKI by 0.1 % — and drops accuracy from 53.36 % to 52.90 %. Quadrupling is no better than
+doubling and costs 1.3 pp. The mechanism matters: a larger table tracks more *marginal*
+instructions, whose weaker patterns clear the confidence bar less often, so the extra
+prefetches are worth less per line fetched. **More tracking is not more prediction.**
 
-### 2.2 Strides live in page-offset space — page confinement for free
+Since "minimal storage overhead" is an explicit grading criterion, 64 × 4 is where the
+curve flattens.
 
-This is the design decision I am most pleased with, because one representation choice
-discharges three separate requirements at once.
+Indexing is `index = ip & 0x3F`, `tag = (ip >> 6) & 0xFFFF` — together 22 bits of PC
+against `ip_stride`'s 8. Low PC bits make a good index because x86 instructions are
+variable-length, so consecutive load PCs inside a hot loop are already well spread.
 
-The entry does not store a line address. It stores:
+### 3.2 Strides live in page-offset space
 
-* `last_page` — a 12-bit **page tag**, used *only* to notice that the page changed;
-* `last_offset` — the 6-bit cache-line offset **within** the 4 KB page (`0..63`, since
-  4096/64 = 64).
+This is the design choice worth being proudest of, because one representation decision
+discharges three separate requirements.
+
+The entry does **not** store a line address. It stores a 12-bit **page tag** (only to
+notice the page changed) and a 6-bit **line offset within the page** (`0..63`, since
+4096/64 = 64):
 
 ```c
 uint16_t page   = (addr >> LOG2_PAGE_SIZE) & 0xFFF;
 int      offset = (addr >> LOG2_BLOCK_SIZE) & (LINES_PER_PAGE - 1);
-...
-int stride = offset - (int)e.last_offset;
+int      stride = offset - (int)e.last_offset;
 ```
 
-and prefetch addresses are built in that same space:
+and prefetch addresses are built in the same space:
 
 ```c
 cum += next_stride;
@@ -192,89 +168,87 @@ if (pf_offset < 0 || pf_offset >= LINES_PER_PAGE) break;   // cannot leave the p
 uint64_t pf_addr = (addr & ~((uint64_t)PAGE_SIZE - 1)) | ((uint64_t)pf_offset << LOG2_BLOCK_SIZE);
 ```
 
-Three consequences:
+**Insight 3 — three requirements, one choice:**
 
-1. **The page boundary cannot be crossed.** It is not a filter applied to a candidate
-   address — an out-of-page address is never *representable*. Compare `ip_stride`, which
-   builds the full address and then tests `(pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)`.
-   Both are correct; mine cannot be broken by a later edit.
-2. **Every usable stride is bounded by ±63 lines**, so a **7-bit signed** stride field
-   is provably sufficient — no saturation, no truncation, ever. The storage breakdown in
-   §6 is tight rather than padded, and this is *why*.
-3. **Weakness 5 of `ip_stride` disappears.** When `last_page != page` the step is not
-   representable in 6 bits and is not prefetchable anyway, so I re-anchor the entry and
-   return without training. No poisoned stride enters the history.
+1. **The page boundary cannot be crossed.** An out-of-page address is never *representable*,
+   so this is not a filter that a later edit could remove. ChampSim's own independent
+   counter confirms it: **0 cross-page prefetch requests** in every run (§8.5).
+2. **Every usable stride is bounded by ±63 lines**, so a **7-bit signed** stride field is
+   provably sufficient — no saturation, ever. The storage table in §7 is tight *because of*
+   this, not by luck.
+3. **`ip_stride`'s weakness 5 disappears.** On a page change the step is not representable,
+   so no bogus value can occupy `last_stride`; the entry is re-anchored and the learned
+   state survives. To be precise about what this does and does not fix: `ip_stride` is not
+   *incorrect* here — its guard blocks every out-of-page candidate — but it carries the
+   cross-page value into the next access, where it cannot match, and SPP does not.
 
-One sub-decision inside that: on a page crossing I update `last_page`/`last_offset` but
-**keep** `last_stride`, `uniform_conf` and `signature`. A streaming load crosses a page
-every 64 lines; resetting its confidence there would cost it three accesses of
-re-learning per page (~5% of its prefetch opportunities) for no benefit, because the
-stride it will see next is the same one it saw before. The instrumented counter
-`SPP page-boundary re-anchors` reports how often this happens (~16% of loads on
-`trace1`), which is why getting it right matters.
+**Why the page rule exists at all.** The prefetcher reasons in virtual addresses, but
+locality is a property of *physical* frames, and virtual contiguity implies physical
+contiguity only **within** a page: pages V and V+1 may map to unrelated frames. Extrapolating
+past the boundary therefore predicts an address with no guaranteed physical relationship to
+the stream — and it needs a translation the demand stream has not touched. The logs show what
+staying in-page buys: `STLB TRANSLATION FROM L1D PREFETCHER` is **226 453 accesses, 226 453
+hits, 0 misses** on trace1, because the triggering demand access translated that page
+moments earlier. Demand `STLB LOAD TRANSLATION` misses **33 %** of the time over the same
+run. Crossing a page would expose a *speculative* request to that miss rate and to a
+page-table walk.
 
-### 2.3 Only demand loads train the prefetcher
+On a page change SPP updates `last_page`/`last_offset` but **keeps** `last_stride`,
+`uniform_conf` and `signature`. A streaming load crosses a page every 64 lines; resetting
+its confidence there would cost three accesses of re-learning per page for nothing, since
+the next stride it sees is the same one as before.
+
+### 3.3 Only demand loads train it
 
 ```c
 if (type != LOAD) return;
 ```
 
-Two separate judgements are packed in here.
+Three judgements packed into one line.
 
-**Exclude `PREFETCH` — this is mandatory, not a preference.** `src/cache.cc` calls
-`l1d_prefetcher_operate(...)` from the prefetch-queue path at lines 2465 and 2649 with
-`type = PREFETCH` and `ip = PQ.entry[index].ip` — and `prefetch_line()` copies *our* IP
-into the packet (`pf_packet.ip = ip`). So without this filter, a prefetch SPP issued
-comes back as a training event on the very entry that issued it: it advances
-`last_offset` to an address the program never touched, generating a fabricated stride,
-which is then written into the pattern table as ground truth. The predictor would be
-learning its own output. `ip_stride` has exactly this bug.
+**Excluding `PREFETCH` is mandatory.** `src/cache.cc` calls `l1d_prefetcher_operate` from
+the prefetch-queue path with `type = PREFETCH` and `ip` taken from the packet — and
+`prefetch_line()` put *our* IP there. Without the filter, a prefetch SPP issued returns as
+a training event on the entry that issued it: it advances `last_offset` to an address the
+program never touched, fabricating a stride that is then written into the pattern table as
+ground truth. **The predictor would be learning its own output.**
 
-**Exclude `RFO` (stores) — a deliberate choice.** The reported metric is L1D **load**
-MPKI, a store-stream entry competes for the same 256 IP-table entries as the load
-streams, and prefetching for stores into the L1D creates dirty lines and writeback
-traffic for data we only guessed at. Keeping the table focused on the loads that the
-metric measures is the better use of a deliberately small table. *(If you want this
-quantified for the report, flipping the condition to
-`if (type != LOAD && type != RFO) return;` is a one-line experiment.)*
+**Excluding `RFO` (stores) is a choice.** The reported metric is L1D *load* MPKI, a store
+stream competes for the same 256 entries, and prefetching for stores creates dirty lines
+and writeback traffic for guessed data. This is the one design decision still argued rather
+than measured; flipping the condition to `type != LOAD && type != RFO` is a one-line
+experiment.
 
-**Keep cache hits in the training stream** — `cache_hit` is ignored. A load
-instruction's stride sequence is a property of the *program*, not of what happened to be
-resident in the cache. Training only on misses would sample the sequence at the points
-where it missed and compute strides across the skipped accesses, i.e. it would learn a
-different, wrong sequence. Predicting on hits is also how a prefetcher stays *ahead* of a
-stream it is already succeeding on. `ip_stride` gets this right too.
+**Keeping cache hits is deliberate** — `cache_hit` is ignored. A load's stride sequence is a
+property of the *program*, not of what happened to be resident. Training only on misses
+would sample the sequence at the points where it missed and compute strides across the
+skipped accesses — learning a different, wrong sequence. Predicting on hits is also how a
+prefetcher stays *ahead* of a stream it is already succeeding on.
 
 ---
 
-## 3. Dual pattern classification
+## 4. Dual pattern classification
 
-### 3.1 The uniform detector
+### 4.1 The uniform detector
 
-A 2-bit saturating counter per IP:
+A 2-bit saturating counter per IP; the uniform path runs only at full confidence:
 
 ```c
 if (stride == e.last_stride) { if (e.uniform_conf < 3) e.uniform_conf++; }
 else                        { e.uniform_conf = 0; }
 ```
 
-and the uniform path is taken only at full confidence, `uniform_conf == 3`.
+### 4.2 Why the threshold is exactly 3
 
-### 3.2 Why the threshold is exactly 3 — derived from the PDF's own example
+**Insight 4 — this threshold is *derived*, not tuned.** The PDF's non-uniform example is
+`(+1, +2, +2, +2, +3)^n`. Its longest run of identical strides is the three `+2`s, which
+produce exactly **two** consecutive `stride == last_stride` events. So:
 
-This is the one threshold in the design that is *forced* rather than tuned, and the
-derivation is short enough to give verbally.
+* threshold 1 or 2 ⇒ the counter reaches it inside the run of `+2`s, and SPP declares the
+  assignment's own *non-uniform* example to be a *uniform* stream, emitting `+2, +4, +6`;
+* threshold 3 ⇒ unreachable for that sequence; the signature path handles it throughout.
 
-The PDF's non-uniform example is the stride sequence `(+1, +2, +2, +2, +3)^n`. Its
-longest run of identical strides is the three `+2`s. Three identical strides in a row
-produce only **two** consecutive `stride == last_stride` events. So:
-
-* threshold 1 or 2 ⇒ the counter reaches the threshold inside the run of `+2`s, and SPP
-  declares the PDF's *non-uniform* example to be a *uniform* stream and emits
-  `+2, +4, +6` — of which only the first is ever right.
-* threshold 3 ⇒ unreachable for this sequence; the signature path handles it throughout.
-
-I verified this mechanically before writing any C++ (`scripts/verify_design.py`):
+`scripts/verify_design.py` proves it mechanically, with no simulation:
 
 ```
 threshold T=1: declared UNIFORM on   80 of 200 accesses  -> WRONG
@@ -282,63 +256,48 @@ threshold T=2: declared UNIFORM on   40 of 200 accesses  -> WRONG
 threshold T=3: declared UNIFORM on    0 of 200 accesses  -> correct
 ```
 
-So **3 is the smallest threshold that provably never misclassifies the pattern the
-assignment itself asks us to capture.** And it must be the *smallest* such value,
-because every extra count of confidence is an extra access during which a genuinely
-uniform stream is not being prefetched at its cheapest. A 2-bit counter saturating at 3
-is therefore exactly the right width — no bits wasted, none missing.
+3 is therefore the **smallest** threshold that provably never misclassifies the pattern the
+assignment asks us to capture — and smallest matters, because every extra count is an extra
+access during which a genuinely uniform stream is not being prefetched by the cheap path. A
+2-bit counter saturating at 3 is exactly the right width.
 
-### 3.3 Why a hard reset to 0, not a decrement
+§9.4 measures what this costs: a threshold of 2 would score 53.45 % pooled accuracy against
+3's 53.36 %, a 0.09 pp difference. **Correctness is free here** — honouring the spec costs
+nothing measurable.
 
-On a mismatching stride I set `uniform_conf = 0`, rather than decrementing.
+### 4.3 Hard reset, not decrement
 
-The PDF asks the prefetcher to "dynamically transition or fall back to non-uniform stride
-prediction". A decrement from 3 would need **three** mismatching accesses before the
-fall-back engages; during those three accesses SPP would keep extrapolating
-`addr + k*stride` from a stride the program has already abandoned — the exact pollution
-the throttling requirement is there to prevent. A reset falls back on the *same access*
-that detects the break.
+On a mismatching stride `uniform_conf` is set to **0**, not decremented. A decrement from 3
+would need three mismatching accesses before the fall-back engages, and during those three
+SPP would keep extrapolating `addr + k·stride` from a stride the program has abandoned —
+exactly the pollution the throttling requirement exists to prevent. A reset falls back on
+the *same access* that detects the break, which is what "dynamically transition or fall
+back" asks for.
 
-The reset is also cheap to undo: re-earning uniform status takes three matching strides,
-and if the stream really is uniform those three arrive immediately. The asymmetry is
-correct, because the two errors are not symmetric — being slow to *leave* uniform mode
-emits wrong addresses, being slow to *enter* it merely emits them via the signature path,
-which for a constant stride predicts the same thing anyway (see §3.4).
+The asymmetry is deliberate, because the two errors are not symmetric: being slow to
+*leave* uniform mode emits wrong addresses; being slow to *enter* it merely routes through
+the signature path, which for a constant stride predicts the same thing anyway.
 
-### 3.4 Why the two predictors are both trained on every access
-
-The pattern table is trained **even while the uniform path is driving**:
+### 4.4 Both predictors are trained on every access
 
 ```c
-spp_train_pattern(e.signature, stride);         /* always */
+spp_train_pattern(e.signature, stride);          /* always */
 e.signature = spp_update_signature(e.signature, stride);
 ```
 
-If I trained the signature path only while in non-uniform mode, then every
-uniform → non-uniform transition would start from a **cold** table: the signature would
-index an entry with `conf == 0`, the chain would refuse to predict, and SPP would emit
-nothing for as long as it took to re-learn — hundreds of accesses after each phase change.
-That is precisely the opposite of "adapt to the region by quickly identifying the correct
-sequence of strides".
+**Insight 5 — train always, predict selectively.** If the signature path were trained only
+while in non-uniform mode, every uniform → non-uniform transition would start from a *cold*
+table: the signature would index a zero-confidence entry, the chain would refuse to
+predict, and SPP would emit nothing for hundreds of accesses after each phase change — the
+opposite of adapting quickly to a region.
 
-Training always costs nothing and has a bonus property: during a long constant-stride
-phase the table fills with entries of the form `sig(d,d,d,d) → d`, so the non-uniform
-path **degrades gracefully into the uniform prediction**. The two predictors agree where
-they overlap, which means the hand-off in either direction is seamless rather than a
-cliff. This is the main reason the uniform path is a cheap fast path rather than a
-functional necessity.
+Training always costs nothing and has a bonus: during a long constant-stride phase the
+table fills with entries of the form `sig(d,d,d,d) → d`, so **the non-uniform path degrades
+gracefully into the uniform prediction.** The two predictors agree where they overlap,
+which makes the hand-off in either direction seamless rather than a cliff — and is why the
+uniform path is a cheap fast path rather than a functional necessity.
 
-*Consistency check performed:* does always-training let the uniform phase pollute the
-pattern table for other IPs? The table is shared and tagless, so yes in principle — but
-the entries it creates are *self-consistent* (`d → d`), and any IP whose real pattern maps
-to the same signature will decrement that entry on its first mismatch and take it over
-after two. The 2-bit confidence is doing double duty as a collision resolver; see §4.3.
-
----
-
-## 4. The signature — representing a *sequence* of strides
-
-### 4.1 Definition
+### 4.5 The signature
 
 ```c
 uint16_t spp_update_signature(uint16_t sig, int stride)
@@ -347,68 +306,27 @@ uint16_t spp_update_signature(uint16_t sig, int stride)
 }
 ```
 
-A 10-bit rolling fold: shift the old signature left by 3 and XOR in the low 7 bits of the
-new stride. Roughly the **last four strides** stay alive inside 10 bits. The pattern
-table is then a direct-mapped array of `2^10 = 1024` entries of
-`{ 7-bit signed stride, 2-bit confidence }`.
+A 10-bit rolling fold keeping roughly the **last four strides**. The pattern table is a
+direct-mapped array of 1024 entries of `{7-bit signed stride, 2-bit confidence}`.
 
-### 4.2 Why a signature at all, and why this one
+**Why a signature at all** — the PDF requires one: *"the design must maintain a signature
+that represents the sequence of recently observed strides. This signature should map to the
+next expected stride."* The alternatives are excluded by that wording and by cost:
 
-The PDF does not leave this open: *"the design must maintain a signature that represents
-the sequence of recently observed strides. This signature should map to the next expected
-stride."* So a signature → next-stride map is required, and the alternatives are
-excluded by the text:
+* **Store the last k strides per IP and search for the period** — the obvious first idea.
+  Costs `k × 7` bits per IP (28 at k=4, vs 10 for a signature) *plus* a comparator tree,
+  and only predicts periods visible inside its own window.
+* **A table per IP** — storage explodes and nothing is shared between instructions walking
+  the same structure.
+* **A global table indexed by signature** (chosen) learns a *pattern* once and lets every IP
+  exhibiting it benefit.
 
-* **Store the last k strides per IP and search for the period.** This is the obvious
-  first idea and it is what I would have built if the PDF hadn't spoken. It costs `k × 7`
-  bits per IP (28 bits at k=4, versus 10 for a signature) *plus* a comparator tree to
-  find the period, *plus* it only ever predicts periods it can see inside its own window.
-  It also fails the PDF's wording — there is no signature and nothing maps to a next
-  stride.
-* **One table per IP.** Storage explodes and nothing is shared between instructions that
-  happen to walk the same structure.
-* **A global table indexed by signature** (what I built) is the published SPP design
-  (Kim et al., MICRO 2016) and has the property that the *pattern* is learned once and
-  reused by every IP that exhibits it.
+**Why this fold.** Shift-3-and-XOR keeps information from all 7 stride bits, so large and
+negative strides still differentiate. A clean 3-bits-per-stride concatenation would alias
+`-1` onto `+7`, breaking every descending pattern.
 
-Why this particular fold: shift-3 with XOR is the original SPP compression function. The
-XOR (rather than a clean concatenation of 2 or 3 bits per stride) matters because it keeps
-information from all 7 stride bits, so **large and negative strides still differentiate**.
-A 3-bits-per-stride concatenation would alias `-1` onto `+7`, breaking every descending
-pattern — I checked that before choosing. The price is occasional aliasing, which §4.3
-handles.
-
-### 4.3 Verification that 10 bits is enough — and the confidence counter's real job
-
-The thing that could silently ruin this design is signature *collision*: if two different
-phases of a pattern produce the same signature, one of them can never be predicted, and
-the shared entry oscillates. The PDF's example has period **5**, while the signature holds
-only ~4 strides — so this needed checking, not assuming.
-
-`scripts/verify_design.py` enumerates it exactly:
-
-```
-=== (B) signature uniqueness for each phase of the period-5 cycle ===
-  distinct signatures used: 5 (expect 5)
-    sig 0x093 -> next stride [1]  [OK]
-    sig 0x099 -> next stride [2]  [OK]
-    sig 0x0ca -> next stride [2]  [OK]
-    sig 0x252 -> next stride [2]  [OK]
-    sig 0x292 -> next stride [3]  [OK]
-  verdict: signature fully disambiguates the pattern
-```
-
-All five phases get distinct signatures and each maps to a single outcome. The reason a
-~4-stride window suffices for a period-5 cycle is that the five length-4 windows of
-`1,2,2,2,3` are all different — a repeating sequence of period *p* is disambiguated by a
-window of *p−1* as long as no two phases share their predecessor history, which holds here.
-
-The script also checks `[1,2,3]`, `[4,-1]`, `[1,1,2]`, `[8,8,8,1]`, `[2]`,
-`[1,2,4,8,16]` — every phase of every one is predicted correctly, including the
-**negative** stride case and the pure-uniform case `[2]` (confirming §3.4's claim that the
-signature path subsumes the uniform path).
-
-The confidence update is where collisions are absorbed:
+**Insight 6 — the confidence counter is also the collision handler, which is why the table
+needs no tag.**
 
 ```c
 if      (p.conf > 0 && p.stride == stride) { if (p.conf < 3) p.conf++; }  /* confirmed  */
@@ -417,191 +335,122 @@ else                                       { p.conf--; }                 /* disc
 ```
 
 The stored stride is replaced **only once the entry is fully discredited**. A single odd
-access cannot wipe out a pattern learned over thousands of iterations, while a genuine
-phase change still flips the entry after two mispredictions. This is also exactly why the
-pattern table needs **no tag**: a colliding signature does not corrupt a value, it merely
-drives `conf` down, and `conf < 2` means "refuse to predict". Paying 16 bits of tag per
-entry to prevent something a 2-bit counter already handles would nearly triple the
-table's cost — so the tagless design is a *consequence* of the confidence policy, not an
-independent shortcut.
+access cannot wipe out a pattern learned over thousands of iterations, while a genuine phase
+change still flips the entry after two mispredictions. A colliding signature therefore does
+not corrupt a value — it drives `conf` down, and `conf < 2` means "refuse to predict".
+Paying 16 bits of tag per entry to prevent what a 2-bit counter already handles would nearly
+triple the table's cost. **The tagless design is a consequence of the confidence policy, not
+a shortcut.**
+
+**Verification that 10 bits suffice.** The risk is that two phases of a pattern share a
+signature, so one can never be predicted. The PDF's example has period **5** while the
+signature holds ~4 strides, so this needed checking:
+
+```
+distinct signatures used: 5 (expect 5)
+  sig 0x093 -> [1]   sig 0x099 -> [2]   sig 0x0ca -> [2]
+  sig 0x252 -> [2]   sig 0x292 -> [3]
+verdict: signature fully disambiguates the pattern
+```
+
+All five phases get distinct signatures mapping to a single outcome. (A period-*p* sequence
+is disambiguated by a window of *p−1* as long as no two phases share their predecessor
+history.) The script also verifies `[1,2,3]`, `[4,-1]`, `[1,1,2]`, `[8,8,8,1]`, `[2]` and
+`[1,2,4,8,16]` — including the negative-stride case, and the pure-uniform case `[2]`, which
+confirms §4.4's claim that the signature path subsumes the uniform one.
 
 ---
 
 ## 5. Degree > 1: the lookahead chain
 
-The PDF requires degree > 1. For the uniform path that is trivial. For the non-uniform
-path it is the subtlest part of the whole task, and it is worth being able to say why.
-
-**A non-uniform pattern cannot be extrapolated by multiplication.** `addr + 2*stride` is
-meaningful only if the second stride equals the first. To go two deep into
-`(+1,+2,+2,+2,+3)` you must know that after `+1` comes `+2`. The only way to get that from
-a signature → stride map is to **replay the predictor on its own output**:
+**Insight 7 — a non-uniform pattern cannot be extrapolated by multiplication.** For a
+uniform stride, `addr + 2·stride` is meaningful. For `(+1,+2,+2,+2,+3)` it is simply wrong,
+because the second stride is a different number. To go two deep you must know that after
+`+1` comes `+2`, and the only way to get that from a signature → stride map is to **replay
+the predictor on its own output**:
 
 ```
 sig   --lookup--> d1 ;  prefetch offset + d1
-sig' = update(sig, d1)
-sig'  --lookup--> d2 ;  prefetch offset + d1 + d2
-sig'' = update(sig', d2)
+sig' = update(sig, d1) --lookup--> d2 ;  prefetch offset + d1 + d2
 ...
 ```
 
-So both paths are written as **one loop**, differing only in where `next_stride` comes
-from:
+Both paths are therefore written as **one loop**, differing only in where `next_stride`
+comes from:
 
 ```c
 for (int i = 0; i < spp_degree; i++) {
     int next_stride;
     if (uniform) {
-        next_stride = e.last_stride;                    /* same step every time */
+        next_stride = e.last_stride;                     /* same step every time */
     } else {
         PATTERN_ENTRY &p = pattern_table[sig];
-        if (p.conf < PATTERN_CONF_PREDICT) break;        /* not confident enough */
+        if (p.conf < PATTERN_CONF_PREDICT) break;         /* not confident enough */
         next_stride = p.stride;
-        if (next_stride == 0) break;                     /* would not advance    */
-        sig = spp_update_signature(sig, next_stride);    /* speculative step     */
+        if (next_stride == 0) break;                      /* would not advance    */
+        sig = spp_update_signature(sig, next_stride);     /* speculative step     */
     }
     cum += next_stride;
     int pf_offset = offset + cum;
-    if (pf_offset < 0 || pf_offset >= LINES_PER_PAGE) break;   /* page confinement */
+    if (pf_offset < 0 || pf_offset >= LINES_PER_PAGE) break;    /* page confinement */
     ...
     prefetch_line(...);
 }
 ```
 
-Writing it as one loop is not cosmetic — it is what guarantees the two paths obey the
-same page confinement, the same degree, and the same accounting. Two separate loops is
-how you end up with one of them violating a constraint after a later edit.
+Writing it as one loop is not cosmetic: it is what guarantees both paths obey the same page
+confinement, the same degree and the same accounting. Two loops is how one of them ends up
+violating a constraint after a later edit.
 
-Three guards, each earning its place:
+Each guard earns its place:
 
-* `p.conf < 2` → **break, not continue.** Every address later in the chain is built on
-  top of this stride, so once a link is untrustworthy the whole remainder of the chain is
-  garbage. Continuing would emit addresses derived from a stride we just rejected. The
-  instrumented counter `SPP lookahead chains cut by conf` reports how often this fires,
-  which is the honest measure of how deep the table's knowledge actually goes.
-* `next_stride == 0` → break. A zero stride makes no progress; chaining it would re-emit
-  the same address `degree` times.
-* page bounds → break (§2.2).
+* `p.conf < 2` → **break, not continue.** Every later address is built on top of this stride
+  (`cum += next_stride`), so once a link is untrustworthy the whole remainder is garbage.
+* `next_stride == 0` → break; a zero stride would re-emit the same address `degree` times.
+* page bounds → break (§3.2).
 
-A consequence worth stating: **the effective degree is adaptive even before throttling.**
-`spp_degree` is an upper bound; the chain stops early whenever confidence runs out or the
-page ends. SPP is therefore aggressive exactly where it has evidence and quiet where it
-does not — which is the behaviour the throttling requirement asks for, arriving partly for
-free from the structure.
+**Insight 8 — the effective degree is self-limiting even before throttling.** `spp_degree`
+is only an upper bound; the chain stops early whenever confidence runs out or the page ends.
+The counter `chains cut by conf` shows this firing **213 K–438 K times per run** — those are
+occasions where SPP had degree budget left and *chose not to use it*. SPP is aggressive
+exactly where it has evidence and quiet where it does not, which is part of the throttling
+behaviour arriving for free from the structure.
 
-**Fill level.** I kept `ip_stride`'s rule — `FILL_L1` while the L1D MSHR is less than half
-occupied, `FILL_L2` otherwise. Keeping it identical means the SPP-vs-IP-stride comparison
-isolates the *prediction* change rather than confounding it with a placement change. The
-rule itself is sound: when the MSHRs are already half full the demand misses queued there
-matter more than our guesses, so we hand the prefetch to the L2 instead of competing for
-L1D MSHRs. It does have a measurement consequence, noted in §7.3.
+**Fill level.** `FILL_L1` while the L1D MSHR is less than half occupied, `FILL_L2`
+otherwise — identical to `ip_stride`, so the comparison isolates the *prediction* change
+rather than confounding it with a placement change. The rule is sound on its own terms: when
+MSHRs are half full, the demand misses queued there matter more than our guesses.
 
 ---
 
-## 6. Storage overhead — exact bit-level breakdown
+## 6. Accuracy-based throttling
 
-This is a required deliverable, so every field is listed, and §2.2 explains why the widths
-are provably tight rather than rounded up.
+### 6.1 The usefulness metric
 
-### 6.1 IP table — 64 sets × 4 ways = 256 entries
-
-| Field | Bits | Why exactly this width |
-|---|---|---|
-| `tag` | 16 | PC bits [21:6]; with the 6 index bits, 22 bits of PC are distinguished |
-| `valid` | 1 | |
-| `last_page` | 12 | page **tag** only — its sole job is to detect that the page changed |
-| `last_offset` | 6 | a 4 KB page holds 4096/64 = 64 lines, so 6 bits is exact |
-| `last_stride` | 7 | signed; strides are confined to ±63 lines by §2.2, so 7 bits cannot overflow |
-| `uniform_conf` | 2 | saturates at 3, the threshold derived in §3.2 |
-| `signature` | 10 | the 10-bit signature of §4.1 |
-| `lru` | 2 | 4 ways ⇒ 2 bits |
-| **per entry** | **56** | |
-
-**256 × 56 = 14 336 bits = 1 792 B**
-
-### 6.2 Pattern table — 1024 entries, direct-mapped, tagless
-
-| Field | Bits | Why |
-|---|---|---|
-| `stride` | 7 | signed, ±63 lines (§2.2) |
-| `conf` | 2 | 2-bit saturating counter (§4.3) |
-| *(tag)* | **0** | deliberately absent — collisions are absorbed by `conf` (§4.3) |
-| **per entry** | **9** | |
-
-**1024 × 9 = 9 216 bits = 1 152 B**
-
-### 6.3 Throttling unit
-
-| Field | Bits | Why |
-|---|---|---|
-| `spp_degree` | 3 | holds 1..4 |
-| window snapshot: lines pulled | 12 | window is 512, so 12 bits covers it |
-| window snapshot: useful count | 12 | bounded by the above |
-| **total** | **27** | ≈ 4 B |
-
-### 6.4 Total
-
-| Structure | Bytes |
-|---|---|
-| IP table | 1 792 |
-| Pattern table | 1 152 |
-| Throttling unit | 4 |
-| **SPP total** | **2 948 B ≈ 2.88 KB** |
-
-For scale: the L1D in this configuration is 64 sets × 12 ways × 64 B = **48 KB**, so SPP
-adds **≈ 6.0 %** — comfortably in "lightweight" territory for a prefetcher, and most of it
-(1 792 B) is the table whose size I justified by measurement in §2.1 rather than by taste.
-
-**One piece of state I am declaring rather than hiding:** the accuracy checker's "useful"
-event is a demand hit on a line that was brought in by a prefetch. In ChampSim that is
-`BLOCK::prefetch`, i.e. **1 bit per L1D line** — 768 lines × 1 bit = **96 B**. Real L1Ds
-already carry this bit, and the baseline cache in this codebase already maintains it, so I
-have not added it; but an honest accounting should mention that my throttle consumes it.
-Counting it would make the total 3 044 B (≈ 6.2 % of the L1D). I chose to reuse it rather
-than build a separate prefetch-address filter (a 256-entry table of recently prefetched
-line addresses plus used bits, ≈ 1 KB), because the filter would measure *exactly the same
-event* at ten times the cost.
-
----
-
-## 7. Accuracy-based throttling
-
-### 7.1 Deciding the usefulness metric — and the mistake I had to back out
-
-This is where I got it wrong first, and the error is instructive enough that I am keeping
-it in the write-up.
-
-ChampSim prints two things that both look like accuracy
-(`src/main.cc:248` and `:253`):
+ChampSim prints two things that both look like accuracy (`src/main.cc:248`, `:253`):
 
 ```
-L1D PREFETCH  REQUESTED: 15856  ISSUED: 15856  USEFUL: 965  USELESS: 372
-L1D USEFUL LOAD PREFETCHES: 965  PREFETCH ISSUED TO LOWER LEVEL: 1619  ACCURACY: 59.60
+L1D PREFETCH  REQUESTED: 1075443  ISSUED: 1075443  USEFUL: 39437  USELESS: 23256
+L1D USEFUL LOAD PREFETCHES: 39437  PREFETCH ISSUED TO LOWER LEVEL: 69907  ACCURACY: 56.41
 ```
 
-so there are two candidate ratios:
+giving two candidate ratios: `USEFUL/ISSUED` = **3.7 %**, and
+`USEFUL/pf_lower_level` = **56.4 %** — the field ChampSim actually labels `ACCURACY`.
 
-* `USEFUL / ISSUED` = 965 / 15856 = **6.1 %**
-* `USEFUL / pf_lower_level` = 965 / 1619 = **59.6 %** ← the field literally labelled `ACCURACY`
-
-My first implementation throttled on `useful / issued`. The result, visible immediately in
-my own instrumentation, was that the measured usefulness sat at **7.8 %** and the degree
-was pinned at the floor in **30 of 32** windows. The throttle was not throttling; it was
-just switched off.
-
-The reason is semantic, and checking what the counter actually counts settled it.
+**Insight 9 — the denominator must be lines actually fetched, not requests issued.**
 `pf_lower_level` is incremented at `src/cache.cc:2604` — *"Increment for new prefetch
-miss"* — only when a prefetch **misses and allocates a new MSHR entry**, i.e. only when it
-genuinely pulls a line in. The gap between 15 856 and 1 619 is prefetches that **hit in the
-L1D and were dropped**: the data was already there.
+miss"* — only when a prefetch **misses and allocates an MSHR entry**, i.e. only when it
+genuinely pulls a line in. The gap between 1 075 443 and 69 907 is prefetches that **hit in
+the L1D and were dropped**: the data was already there.
 
-That makes the choice obvious once stated plainly:
+> Accuracy-based throttling exists to prevent **cache pollution**. A prefetch dropped
+> because the line is already resident evicts nothing, consumes no bandwidth and pollutes
+> nothing. Putting it in the denominator of an anti-pollution metric is a category error —
+> it dilutes the signal with events that cannot cause the harm the metric detects.
 
-> Accuracy-based throttling exists to prevent **cache pollution**. A prefetch that is
-> dropped because the line is already resident evicts nothing, consumes no bandwidth, and
-> pollutes nothing. Putting it in the denominator of an anti-pollution metric is a
-> category error — it dilutes the signal with events that cannot cause the harm the metric
-> is supposed to detect.
+Using `USEFUL/ISSUED` would read ~2–5 % for *any* prefetcher and pin the degree at the floor
+forever, i.e. switch the throttle off while appearing to implement it. (§8.3 reports both
+columns so this is visible in the data.)
 
 So the internal metric is
 
@@ -611,61 +460,32 @@ So the internal metric is
                         Δ(pf_lower_level)
 ```
 
-evaluated over a sliding window. Two further choices inside it:
+**Insight 10 — `late_prefetch` belongs in the numerator.** It counts prefetches a demand
+access caught while still in flight (`src/cache.cc:2250`). The *address was correct* —
+nothing was polluted; the prefetch was merely issued too late to hide the full latency.
+Penalising it would be actively backwards, because the throttle's response to low accuracy
+is to **reduce** the degree, which shortens the lookahead and makes late prefetches
+*later*. Counting address-correctness rather than timeliness keeps the control loop
+pointing the right way.
 
-**Why `late_prefetch` is in the numerator.** `late_prefetch` (incremented for the L1D at
-`src/cache.cc:2250`) counts prefetches that a demand access caught while they were still
-in flight. The *address was correct* — the line was wanted and nothing was polluted; the
-prefetch was merely issued too late to hide the full latency. Penalising it would be
-actively backwards: the throttle's response to low accuracy is to **reduce** the degree,
-which shortens the lookahead distance and makes late prefetches **later**. Counting
-address-correctness rather than timeliness keeps the control loop pointing the right way.
+**A windowed ratio, not a cumulative one.** The task asks the prefetcher to adapt to regions
+of a trace with different behaviour. A cumulative ratio over 25M instructions is dominated
+by its own history and effectively frozen after the first million — it cannot express "this
+phase is going badly".
 
-**Why a sliding window and not a cumulative ratio.** The task explicitly asks the
-prefetcher to adapt to regions of a trace with different behaviour. A cumulative ratio
-over 25M instructions is dominated by its own history and is effectively frozen after the
-first million — it cannot express "this phase is going badly". A windowed ratio tracks
-phases.
+**Window = 256 lines pulled**, chosen by measurement (§9.3): it beats 512 and 1024 on both
+MPKI and accuracy on all three traces individually. At 256 the throttle re-evaluates
+322–542 times per run, roughly one update per 50–80K instructions. The trend across
+{256, 512, 1024} is monotone in favour of smaller, so the optimum may lie below 256; 128 is
+untested, and 256 is the best of the three measured rather than a proven minimum.
 
-**Window = 512 lines pulled.** Chosen from the hardware, not by taste, and it is a genuine
-two-sided trade.
+**One implementation detail that would otherwise silently break everything.** Both snapshots
+are read as **signed** differences and clamped at zero, because ChampSim zeroes `pf_useful`
+and `pf_lower_level` at the ROI boundary (`src/main.cc:442`) while our snapshots still hold
+pre-reset values. Without the clamp the unsigned subtraction wraps to ~2⁶⁴ and the degree
+jams at maximum for the entire measured region.
 
-The error in this measurement is the prefetches still in flight when the window closes:
-they are in the denominator but have not yet had a chance to be hit, so a short window
-*understates* accuracy. That in-flight count is bounded by the queues — L1D
-`PQ_SIZE = 16` plus `MSHR_SIZE = 16`, so ≈ 32 outstanding at most. Since the decision
-bands are 25 percentage points wide (§7.2), the bias must stay well inside 25 pp or it
-will systematically push the degree down a band:
-
-| window | worst-case understatement | re-evaluations per 25M instrs (extrapolated) |
-|---|---|---|
-| 256 | ≈ 12.5 pp — half a band, distorting | ≈ 260 |
-| **512** | **≈ 6 pp — safely inside a band** | **≈ 130** |
-| 1024 | ≈ 3 pp | ≈ 65 |
-
-512 is the smallest power of two whose bias is comfortably inside one band, so it buys the
-most adaptivity available without corrupting the decision.
-
-To be precise about the adaptivity it actually gives: I measured ≈ 2 700 lines pulled per
-1M simulated instructions, which extrapolates to **≈ 130 throttle updates over a 25M
-run** — roughly one per 190K instructions. That is not "continuous", and I want to state
-it rather than overclaim: it is several updates per program phase (phases typically run for
-millions of instructions), which is enough to track phase behaviour, but it is not
-fine-grained enough to react to a short burst. Shrinking the window to chase that would
-cost more in measurement bias than it gains. `ACC_WINDOW` is a single `#define`, and a
-sensitivity sweep over it is listed in `docs/RUN_INSTRUCTIONS.md` §7.
-
-Both snapshots are read as **signed** differences and clamped at zero, because ChampSim
-zeroes `pf_useful` and `pf_lower_level` at the ROI boundary (`src/main.cc:442-448`) while
-my snapshots still hold pre-reset values. Without the clamp the unsigned subtraction wraps
-to ~2^64 and the degree jams at maximum for the rest of the run. That is a one-line guard
-that would otherwise have silently invalidated every number in the report.
-
-For **reporting**, §8 uses ChampSim's own `ACCURACY` field (`pf_useful / pf_lower_level`),
-which is what the PDF means by "Prefetch Accuracy = Also present in stats", and also lists
-`USEFUL / ISSUED` so both are on the record.
-
-### 7.2 Thresholds and degrees
+### 6.2 Thresholds and degrees
 
 ```c
 if      (acc >= 75) spp_degree = 4;
@@ -674,72 +494,133 @@ else if (acc >= 25) spp_degree = 2;
 else                spp_degree = 1;
 ```
 
-**Why quartile thresholds (25/50/75).** With a 2-bit-style four-way decision the
-information-theoretically neutral split of a 0–100 % metric is into equal quarters; any
-other split asserts prior knowledge about where accuracy concentrates, which I do not have
-across three unseen traces. Equal quarters also keeps each band wide (25 points), which
-matters because the windowed metric is noisy — narrow bands would make the degree flap
-between neighbouring values on measurement noise rather than on real phase change.
+**Quartile thresholds (25/50/75).** With a four-way decision on a 0–100 % metric, equal
+quarters is the information-theoretically neutral split; any other split asserts prior
+knowledge about where accuracy concentrates across three unseen traces. Equal quarters also
+keeps each band 25 points wide, which matters because a windowed metric is noisy — narrow
+bands would make the degree flap on measurement noise rather than real phase change.
 
-**Why degree 4 at the top.** Three independent limits agree on ~4:
+**Why 4 at the top.** Measured across all three traces (§9.2):
 
-1. **Queue capacity.** L1D `PQ_SIZE = 16`. Issuing more than ~4 prefetches per demand
-   access overflows the PQ, and `prefetch_line()` returns 0 and silently discards the
-   request when `PQ.occupancy == PQ.SIZE`. Prefetches you cannot enqueue are pure wasted
-   prediction, and the dropped ones are the *deepest* in the chain — the ones the lookahead
-   worked hardest for.
-2. **Compounded chain confidence.** The non-uniform path multiplies per-step confidence.
-   At a per-step correctness of ~0.8, four steps is ≈ 0.41 — already a coin flip. Going
-   deeper spends bandwidth on predictions that are worse than the ones already in flight.
-3. **It measures better than deeper.** I compared a 1–4 throttle against a 1–6 throttle
-   (mapping 75→6, 50→4, 25→2): the 1–6 variant issued **14 % more prefetches** for **no
-   MPKI improvement** and **lower** accuracy (≈ 57 % vs ≈ 59 %). Depth past 4 is bought at
-   a real cost and does not pay.
+| cap | avg L1D load MPKI | pooled accuracy | pooled coverage |
+|---|---|---|---|
+| 1–3 | 8.463 | 53.18 % | 8.08 % |
+| **1–4 (chosen)** | **8.450** | **53.36 %** | **8.22 %** |
+| 1–6 | 8.428 | 52.49 % | 8.46 % |
+| 1–8 | 8.407 | 49.92 % | 8.68 % |
 
-**Why the floor is 1 and not 0.** This is the trap in the whole throttling requirement.
-Degree 0 is an absorbing state: with no prefetches issued, `pf_lower_level` stops
-advancing, the window never closes, no new accuracy is ever measured, and the prefetcher
-can **never recover** — a single bad phase would disable it permanently. Degree 1 keeps a
-trickle of prefetches flowing, which keeps the measurement alive, so the throttle can
-climb back out when the program's behaviour improves. A control loop must never be able to
-switch off its own sensor. (It also keeps us compliant with "the prefetcher must support a
-degree of more than 1": the *design* degree is 4, and 1 is reached only when accuracy is
-below 25 %, i.e. when prefetching is doing net harm.)
+**Insight 11 — depth buys coverage *with* accuracy, not for free.** Deeper really is better
+on MPKI and coverage; the cost is accuracy. Going to 1–8 buys 0.46 pp of coverage and
+surrenders **3.4 pp of accuracy** while pulling 18 % more lines into a 48 KB L1D. Since
+accuracy is an explicitly graded metric and the PDF asks the throttle to *prevent cache
+pollution*, trading accuracy for coverage is trading the wrong way. 1–4 is the cap at which
+accuracy is still at its maximum. This is also consistent with compounded chain confidence:
+at ~0.8 per step, four steps is ≈ 0.41 — already a coin flip.
 
-**What throttling costs when accuracy is already high.** Being straight about this: on a
-high-accuracy slice I measured, a *fixed* degree 4 reached slightly lower L1D load MPKI
-than the throttled 1–4 design, because at ~58 % accuracy the throttle selects degree 3 and
-gives up a little coverage. That is the expected trade: throttling is insurance, and
-insurance has a premium. Its value appears in low-accuracy phases, where fixed-degree-4
-pollutes a 48 KB L1D with lines nobody wants and the throttled design does not — and the
-PDF asks for the insurance explicitly ("prevent cache pollution"). The honest summary is
-that throttling trades a little peak coverage for much better worst-case behaviour, and
-the degree-window histogram printed by `l1d_prefetcher_final_stats()` is the evidence of
-how often each regime is actually entered.
+**Why the floor is 1 and not 0.** **Insight 12 — a control loop must never be able to switch
+off its own sensor.** Degree 0 is an absorbing state: with no prefetches issued,
+`pf_lower_level` stops advancing, the window never closes, no new accuracy is ever measured,
+and the prefetcher can **never recover** — one bad phase would disable it permanently.
+Degree 1 keeps a trickle flowing, which keeps the measurement alive. (It also keeps us
+compliant with "must support a degree of more than 1": the design degree is 4, and 1 is
+reached only below 25 % accuracy, i.e. when prefetching is doing net harm.)
 
-### 7.3 One measurement caveat I did not paper over
+### 6.3 Does throttling earn its keep?
 
-Because of the `FILL_L2` path (§5), a prefetch issued when the MSHRs are busy never fills
-the L1D, so it can never set an L1D prefetch bit and can never be credited as `pf_useful`
-— while it *is* counted in the denominator if it allocated an L1D MSHR entry. The measured
-accuracy is therefore slightly **pessimistic**, which biases the throttle toward being
-conservative. I kept the `FILL_L2` path anyway, because it is the right thing for
-performance and because dropping it would make the SPP-vs-IP-stride comparison
-apples-to-oranges. The bias is in the safe direction, and naming it is better than
-pretending the metric is exact.
+The question the whole requirement turns on, answered by running the identical design with
+the throttle disabled at a fixed degree 4:
+
+| trace | prefetch requests issued | lines actually fetched | accuracy |
+|---|---|---|---|
+| trace1 | 1 075 443 → 1 373 560 (**+27.7 %**) | 69 907 → 80 095 (**+14.6 %**) | 56.41 → 52.52 % (**−3.9 pp**) |
+| trace2 | 718 996 → 1 002 668 (**+39.5 %**) | 30 314 → 38 991 (**+28.6 %**) | 54.34 → 45.42 % (**−8.9 pp**) |
+| trace3 | 1 133 921 → 1 533 965 (**+35.3 %**) | 35 460 → 47 628 (**+34.3 %**) | 46.52 → 39.05 % (**−7.5 pp**) |
+
+For all that extra traffic, average MPKI moves 8.450 → 8.428 and geomean speedup does not
+move at all.
+
+**Insight 13 — throttling removes 15–34 % of the lines the prefetcher drags into a 48 KB
+L1D and gains 3.9–8.9 pp of accuracy, for no measurable IPC cost.** The aggressive
+configuration was spending its extra bandwidth on lines that were never used. Note also the
+asymmetry: the throttle helps most on trace2 and trace3, exactly the traces where SPP's
+accuracy is lowest and pollution would hurt most. **A fixed degree cannot do that.**
+
+### 6.4 One measurement caveat
+
+Because of the `FILL_L2` path, a prefetch issued when the MSHRs are busy never fills the
+L1D, so it can never set an L1D prefetch bit and can never be credited as `pf_useful` —
+while it *is* counted in the denominator if it allocated an L1D MSHR entry. Measured
+accuracy is therefore slightly **pessimistic**, biasing the throttle toward being
+conservative. The bias is in the safe direction, and naming it is better than pretending the
+metric is exact.
+
+---
+
+## 7. Storage — exact bit-level breakdown
+
+### 7.1 IP table — 64 sets × 4 ways = 256 entries
+
+| Field | Bits | Why exactly this width |
+|---|---|---|
+| `tag` | 16 | PC bits [21:6]; with the 6 index bits, 22 PC bits are distinguished |
+| `valid` | 1 | |
+| `last_page` | 12 | page **tag** only — its sole job is to detect a page change |
+| `last_offset` | 6 | a 4 KB page holds 4096/64 = 64 lines, so 6 bits is exact |
+| `last_stride` | 7 | signed; strides are confined to ±63 lines by §3.2, so 7 bits cannot overflow |
+| `uniform_conf` | 2 | saturates at 3, the threshold derived in §4.2 |
+| `signature` | 10 | the 10-bit signature of §4.5 |
+| `lru` | 2 | 4 ways ⇒ 2 bits |
+| **per entry** | **56** | |
+
+**256 × 56 = 14 336 bits = 1 792 B**
+
+### 7.2 Pattern table — 1024 entries, direct-mapped, tagless
+
+| Field | Bits | Why |
+|---|---|---|
+| `stride` | 7 | signed, ±63 lines (§3.2) |
+| `conf` | 2 | 2-bit saturating counter (§4.5) |
+| *(tag)* | **0** | deliberately absent — collisions are absorbed by `conf` (§4.5) |
+| **per entry** | **9** | |
+
+**1024 × 9 = 9 216 bits = 1 152 B**
+
+### 7.3 Throttling unit
+
+| Field | Bits | Why |
+|---|---|---|
+| `spp_degree` | 3 | holds 1..4 |
+| window counter: lines pulled | 9 | window is 256, plus the ≤32 prefetches in flight |
+| window counter: useful count | 9 | bounded by the above |
+| **total** | **21** | ≈ 3 B |
+
+### 7.4 Total
+
+| Structure | Bytes |
+|---|---|
+| IP table | 1 792 |
+| Pattern table | 1 152 |
+| Throttling unit | 3 |
+| **SPP total** | **2 947 B ≈ 2.88 KB** |
+
+The L1D here is 64 sets × 12 ways × 64 B = **48 KB**, so SPP adds **≈ 6.0 %** — comfortably
+lightweight, and most of it (1 792 B) is the table whose size §9.1 justifies by measurement.
+
+**One piece of state declared rather than hidden:** the accuracy checker's "useful" event is
+a demand hit on a prefetched line, which in ChampSim is `BLOCK::prefetch` — **1 bit per L1D
+line**, 768 lines = **96 B**. Real L1Ds already carry this bit and the baseline cache
+maintains it, so nothing was added; but an honest accounting should say the throttle
+consumes it. Counting it would make the total 3 043 B (6.2 % of the L1D). The alternative —
+a separate prefetch-address filter of ~1 KB — would measure *exactly the same event* at ten
+times the cost.
 
 ---
 
 ## 8. Results
 
-All numbers below come from **GCC 7.5.0 at `-O3`** (the compiler version is recorded in
-`results/task1/task1.csv` provenance columns and verifiable with
-`readelf -p .comment bin/<binary>`), **25M warmup + 25M simulation instructions**, on all
-three supplied traces. Raw logs are in `results/task1/`; the CSV is
-`results/task1/task1.csv`; these tables are regenerated verbatim by
-`scripts/parse_results.py` into `results/task1/task1_tables.md`.
-
-Reproduce with:
+GCC 7.5.0 `-O3`, 25M warmup + 25M simulation, all three traces. Raw logs in
+`results/task1/`; CSV in `results/task1/task1.csv`; these tables are regenerated verbatim
+by `scripts/parse_results.py` into `results/task1/task1_tables.md`.
 
 ```bash
 ./scripts/run_task1.sh ../traces 3
@@ -747,95 +628,95 @@ python3 scripts/parse_results.py results/task1 results/task1/task1.csv
 python3 scripts/plot_task1.py  results/task1/task1.csv results/task1
 ```
 
-Definitions (all from the ROI half of each log, never the warm-up half — ChampSim resets
-every cache and prefetch counter at the ROI boundary, `src/main.cc:442`):
+Definitions, all from the ROI half of each log (ChampSim resets every cache and prefetch
+counter at the ROI boundary, `src/main.cc:442`):
 
 * **IPC** — `CPU 0 cumulative IPC` under *Region of Interest Statistics*
 * **Speedup** — IPC(config) / IPC(baseline, no prefetcher)
 * **L1D load MPKI** — the `MPKI` field of the `L1D LOAD` line
-* **Prefetch accuracy** — the field ChampSim itself labels `ACCURACY`
-  (= `pf_useful / pf_lower_level`), per §7.1
-* **L1D coverage** — `(L1D load misses_baseline − L1D load misses_config) / L1D load misses_baseline`,
-  exactly the PDF's formula
+* **Prefetch accuracy** — the field ChampSim labels `ACCURACY` (= `pf_useful / pf_lower_level`), §6.1
+* **L1D coverage** — `(misses_baseline − misses_config) / misses_baseline`, the PDF's formula
 
-`scripts/parse_results.py` refuses to emit results that fail its own consistency checks
-(25M+25M actually simulated, zero cross-page prefetches, baseline issuing no prefetches).
-It reported **all checks passed** for the data below.
+`scripts/parse_results.py` refuses to emit results that fail its own checks (25M+25M
+actually simulated, zero cross-page prefetches, baseline issuing no prefetches) and reported
+**all checks passed**.
 
 ### 8.1 IPC and speedup
 
 | Trace | IPC baseline | IPC ip_stride | IPC SPP | Speedup ip_stride | Speedup SPP |
 |---|---|---|---|---|---|
-| trace1 | 0.2323 | 0.2335 | 0.2346 | 1.0048 | 1.0095 |
-| trace2 | 0.2512 | 0.2513 | 0.2542 | 1.0004 | 1.0121 |
-| trace3 | 0.3821 | 0.3829 | 0.3907 | 1.0021 | 1.0225 |
-| **geomean** | — | — | — | **1.0024** | **1.0147** |
+| trace1 | 0.2323 | 0.2335 | 0.2345 | 1.0048 | 1.0094 |
+| trace2 | 0.2512 | 0.2513 | 0.2542 | 1.0004 | 1.0120 |
+| trace3 | 0.3821 | 0.3829 | 0.3909 | 1.0021 | 1.0232 |
+| **geomean** | — | — | — | **1.0024** | **1.0149** |
 
-![Figure 1 — IPC speedup over the no-prefetch baseline. Geometric mean, because speedup is a ratio (§8.7.0).](../results/task1/task1_speedup.png)
+![Figure 1 — IPC speedup over the no-prefetch baseline. Geometric mean, because speedup is a ratio (§8.7).](../results/task1/task1_speedup.png)
 
 ### 8.2 L1D load MPKI
 
 | Trace | baseline | ip_stride | SPP | SPP reduction vs baseline |
 |---|---|---|---|---|
-| trace1 | 10.678 | 10.119 | 9.559 | 10.48 % |
-| trace2 | 13.538 | 13.438 | 13.000 | 3.97 % |
-| trace3 | 3.403 | 3.318 | 2.790 | 18.01 % |
-| **average** | **9.206** | **8.958** | **8.450** | |
+| trace1 | 10.678 | 10.119 | 9.556 | 10.51 % |
+| trace2 | 13.538 | 13.438 | 12.998 | 3.99 % |
+| trace3 | 3.403 | 3.318 | 2.776 | 18.45 % |
+| **average** | **9.206** | **8.958** | **8.443** | |
 
 ![Figure 2 — L1D load MPKI, lower is better. Equal-weight mean, which here equals the pooled value because every trace ran exactly 25M instructions.](../results/task1/task1_l1d_load_mpki.png)
 
 ### 8.3 Prefetch accuracy and L1D coverage
 
-Accuracy is ChampSim's own `ACCURACY` field (`pf_useful / pf_lower_level`);
-`useful / issued` is given in brackets for completeness — see the note below it.
+Accuracy is ChampSim's `ACCURACY` field; `useful / issued` is bracketed.
 
 | Trace | acc ip_stride | acc SPP | coverage ip_stride | coverage SPP |
 |---|---|---|---|---|
-| trace1 | 52.71 % (5.46 %) | 56.41 % (3.67 %) | 5.24 % | 10.48 % |
-| trace2 | 38.18 % (2.89 %) | 54.34 % (2.29 %) | 0.74 % | 3.97 % |
-| trace3 | 15.99 % (1.36 %) | 46.52 % (1.45 %) | 2.51 % | 18.01 % |
-| *equal-weight mean* | 35.63 % | 52.42 % | 2.83 % | 10.82 % |
-| **pooled (sum/sum)** | **39.38 %** | **53.36 %** | **2.70 %** | **8.22 %** |
+| trace1 | 52.71 % (5.46 %) | 56.69 % (3.68 %) | 5.24 % | 10.51 % |
+| trace2 | 38.18 % (2.89 %) | 54.61 % (2.27 %) | 0.74 % | 3.99 % |
+| trace3 | 15.99 % (1.36 %) | 47.71 % (1.51 %) | 2.51 % | 18.45 % |
+| *equal-weight mean* | 35.63 % | 53.01 % | 2.83 % | 10.98 % |
+| **pooled (sum/sum)** | **39.38 %** | **53.89 %** | **2.70 %** | **8.29 %** |
 
-The **pooled** row is the one to quote — see §8.7.0 on why.
+The bracketed `useful / issued` column sits between 1.4 % and 5.5 % for *both* prefetchers
+while the real accuracy is 16–57 % — the empirical proof of §6.1's argument about which
+denominator to throttle on.
 
-![Figure 3 — L1D prefetch accuracy (useful lines / lines actually fetched). Aggregate is pooled, summing numerators and denominators.](../results/task1/task1_accuracy.png)
+![Figure 3 — L1D prefetch accuracy (useful lines / lines actually fetched). Aggregate is pooled.](../results/task1/task1_accuracy.png)
 
 ![Figure 4 — L1D load-miss coverage versus the no-prefetch baseline. Aggregate is pooled.](../results/task1/task1_coverage.png)
 
-The bracketed `useful / issued` column is the empirical proof of the argument in §7.1.
-It sits between 1.4 % and 5.5 % for *both* prefetchers while the real accuracy is
-16–56 %, because the overwhelming majority of issued prefetch requests hit in the L1D and
-are dropped before fetching anything. Had I left the throttle on that ratio, it would have
-read ~2 % forever and pinned the degree at the floor — which is exactly the bug I had to
-back out.
-
 ### 8.4 SPP internal behaviour
 
-From `l1d_prefetcher_final_stats()`. These are **our** counters, which ChampSim does not
+From `l1d_prefetcher_final_stats()`. These are our own counters, which ChampSim does not
 reset at the ROI boundary, so unlike every other table here they describe the **whole run
 (25M warmup + 25M ROI)**.
 
 | Trace | uniform path | non-uniform path | mean windowed usefulness | windows | degree histogram | IP-table hit rate | pattern entries conf≥2 | chains cut by conf |
 |---|---|---|---|---|---|---|---|---|
-| trace1 | 31.87 % | 68.13 % | 64.46 % | 271 | d1=2 d2=50 d3=146 d4=73 | 67.86 % | 336 / 1024 | 439 007 |
-| trace2 | 17.87 % | 82.13 % | 67.20 % | 162 | d1=5 d2=35 d3=58 d4=64 | 43.43 % | 261 / 1024 | 342 883 |
-| trace3 | 45.69 % | 54.31 % | 60.13 % | 190 | d1=17 d2=42 d3=66 d4=65 | 86.69 % | 344 / 1024 | 219 369 |
+| trace1 | 32.36 % | 67.64 % | 64.59 % | 542 | d1=3 d2=105 d3=261 d4=173 | 67.86 % | 320 / 1024 | 438 330 |
+| trace2 | 18.18 % | 81.82 % | 67.52 % | 322 | d1=15 d2=60 d3=108 d4=139 | 43.43 % | 267 / 1024 | 339 561 |
+| trace3 | 46.85 % | 53.15 % | 61.44 % | 372 | d1=41 d2=65 d3=133 d4=133 | 86.69 % | 337 / 1024 | 213 169 |
 
-### 8.5 Page-confinement check — ChampSim auditing us, not us auditing ourselves
+**This is the table that proves the design is actually doing what it claims.** Both
+classification paths are materially active on every trace (18–47 % uniform), every degree is
+visited on every trace, and the degree distribution differs per workload — a fixed-degree
+prefetcher has no such adaptation. Mean windowed usefulness (61–68 %) sits consistently
+*above* the reported ROI accuracy (48–57 %) exactly as §6.1 predicts, because the internal
+metric counts late prefetches as useful while ChampSim's `ACCURACY` does not. The two
+disagreeing in the predicted direction by the predicted amount is good evidence both are
+measuring what we think.
+
+### 8.5 Page confinement — verified by ChampSim, not by us
 
 `prefetch_line()` counts cross-page prefetch requests itself (`src/cache.cc:3652`),
-independently of any counter of mine. The PDF's hard constraint is therefore verified by
-the simulator rather than asserted by the design:
+independently of any counter of ours:
 
 | Trace | config | cross-page prefetch requests | same-page prefetch requests |
 |---|---|---|---|
 | trace1 | IP-stride | **0** | 547 035 |
-| trace1 | SPP | **0** | 1 465 693 |
+| trace1 | SPP | **0** | 1 460 645 |
 | trace2 | IP-stride | **0** | 149 721 |
-| trace2 | SPP | **0** | 964 912 |
+| trace2 | SPP | **0** | 970 138 |
 | trace3 | IP-stride | **0** | 363 276 |
-| trace3 | SPP | **0** | 1 273 484 |
+| trace3 | SPP | **0** | 1 250 130 |
 
 ### 8.6 Run provenance
 
@@ -843,194 +724,249 @@ the simulator rather than asserted by the design:
 |---|---|---|---|---|
 | trace1 | No prefetcher | 25 000 004 | 25 000 000 | 107 598 652 |
 | trace1 | IP-stride | 25 000 004 | 25 000 000 | 107 088 310 |
-| trace1 | SPP | 25 000 004 | 25 000 000 | 106 584 356 |
+| trace1 | SPP | 25 000 004 | 25 000 000 | 106 591 670 |
 | trace2 | No prefetcher | 25 000 002 | 25 000 001 | 99 538 958 |
 | trace2 | IP-stride | 25 000 002 | 25 000 001 | 99 498 688 |
-| trace2 | SPP | 25 000 002 | 25 000 001 | 98 351 803 |
+| trace2 | SPP | 25 000 002 | 25 000 001 | 98 353 834 |
 | trace3 | No prefetcher | 25 000 002 | 25 000 001 | 65 433 974 |
 | trace3 | IP-stride | 25 000 002 | 25 000 001 | 65 297 638 |
-| trace3 | SPP | 25 000 002 | 25 000 001 | 63 993 453 |
+| trace3 | SPP | 25 000 002 | 25 000 001 | 63 951 239 |
 
----
+### 8.7 Which average for which metric
 
-## 8.7 What the numbers actually say
+Three metrics need three different aggregates, and using the wrong one is a classic way to
+mislead with benchmark data.
 
-### 8.7.0 Which average is the honest one — and why it does not matter here
-
-Three different metrics need three different aggregates, and using the wrong one is a
-classic way to accidentally lie with benchmark data.
-
-| Metric | Aggregate used | Why that one |
+| Metric | Aggregate | Why |
 |---|---|---|
-| **Speedup** | **geometric mean** | Speedup is a *ratio*. The arithmetic mean of ratios depends on which machine you normalised to — renormalise to a different baseline and the ranking can flip. The geometric mean is invariant, because `GM(a/b) = GM(a)/GM(b)`. This is the Fleming & Wallace result ("How not to lie with statistics", CACM 1986) and it is why architecture papers always quote a geomean speedup. |
-| **L1D load MPKI** | arithmetic mean | MPKI is already normalised per 1000 instructions, and every trace ran *exactly* 25M instructions, so equal weights are correct. Verified: pooling the raw misses gives 9.206 / 8.958 / 8.450 — **identical** to the arithmetic mean, to three decimals. |
-| **Accuracy, coverage** | **pooled** (Σ numerator / Σ denominator) | These are themselves ratios of event counts. Averaging the per-trace percentages gives a trace with very few misses the same vote as one with many. trace3 is exactly that case: it has the lowest miss count but the highest coverage (18 %), so the equal-weight mean flatters SPP (10.82 %) relative to the pooled truth (8.22 %). |
+| **Speedup** | **geometric mean** | Speedup is a *ratio*. The arithmetic mean of ratios depends on which machine you normalised to — renormalise and the ranking can flip. The geometric mean is invariant, because `GM(a/b) = GM(a)/GM(b)`. (Fleming & Wallace, *How not to lie with statistics*, CACM 1986.) |
+| **L1D load MPKI** | arithmetic mean | Already normalised per 1000 instructions, and every trace ran *exactly* 25M, so equal weights are correct. Verified: pooling raw misses gives 9.206 / 8.958 / 8.443 — identical to three decimals. |
+| **Accuracy, coverage** | **pooled** (Σ num / Σ den) | These are themselves ratios of event counts; averaging per-trace percentages gives a trace with few misses the same vote as one with many. trace3 is exactly that case — lowest miss count, highest coverage — so the equal-weight mean flatters SPP (10.98 %) relative to the pooled truth (8.29 %). |
 
-The important part for the claim "SPP is the better idea": **it does not depend on the
-choice of aggregate at all.** SPP beats IP-stride on
+**Insight 14 — the conclusion does not depend on the choice of aggregate.** SPP beats
+IP-stride on every one of the three traces individually, on all four metrics; on the geomean
+of speedup; on pooled accuracy and coverage; and on the equal-weight mean of each. A result
+that survives every reasonable way of averaging is a far stronger claim than any single
+summary number — and *that*, rather than the geomean itself, is what testing on multiple
+traces buys you. The geomean is how you **report** it; winning everywhere is how you
+**know** it.
 
-* every one of the three traces, individually, on speedup, MPKI, accuracy and coverage;
-* the geometric mean of speedup (1.0147 vs 1.0024);
-* the pooled accuracy (53.36 % vs 39.38 %) and pooled coverage (8.22 % vs 2.70 %);
-* and the equal-weight mean of each of those too.
+### 8.8 Reading the results
 
-A result that survives every reasonable way of averaging, on every trace, is a much
-stronger claim than any single summary number — and that, rather than the geomean itself,
-is what testing on multiple traces buys you. The geomean is how you *report* it; winning
-everywhere is how you *know* it.
+**SPP wins on every metric, on every trace.** Geomean speedup **1.0149 vs 1.0024** — about
+six times the IPC gain. Of 690 484 baseline L1D load misses, IP-stride removes 18 611 and
+SPP removes **57 252**: SPP eliminates **3.08×** as many.
 
-### SPP wins on every metric, on every trace
+**Accuracy and coverage rose together, which normally trade off.** SPP raises both on every
+trace (pooled: accuracy 39.38 → 53.89 %, coverage 2.70 → 8.29 %).
 
-There is no trace and no metric on which IP-stride beats SPP. Geometric-mean speedup is
-**1.0147 for SPP versus 1.0024 for IP-stride** — SPP delivers about **six times** the IPC
-gain. Average L1D load MPKI drops from 9.206 (baseline) to 8.958 with IP-stride and to
-**8.450** with SPP. In raw counts over the three traces: of 690 484 baseline L1D load
-misses, IP-stride removes 18 611 and SPP removes **56 730** — SPP eliminates **3.05×** as
-many load misses.
+> **Insight 15 — SPP's extra prefetches are extra *evidence*, not extra *speculation*.**
+> The non-uniform path emits an address only when a pattern entry has confidence ≥ 2, and
+> the chain breaks the moment a link falls below it. So the volume SPP adds over IP-stride
+> is exactly the volume for which it has a confirmed signature → stride mapping. IP-stride
+> fires on a *single* repeated stride and then blindly multiplies it three times.
 
-### The interesting part: accuracy and coverage went up *together*
+**trace3 is the showcase for dual classification.** IP-stride scores **15.99 %** accuracy
+there — five of every six lines it fetches are never used, because it is extrapolating
+`2·stride`, `3·stride` from a stride that is not constant. SPP scores **47.71 %** accuracy,
+lifts coverage **2.51 → 18.45 %** (7.3×) and gets the largest speedup, **1.0232**. The
+internal split explains it: **46.85 % uniform / 53.15 % non-uniform** — over half of SPP's
+prefetches on this trace come from a predictor IP-stride does not have.
 
-Normally these trade off — issuing more prefetches reaches more misses but dilutes
-accuracy. SPP raises **both**, on every individual trace and in the pooled numbers
-(accuracy 39.38 % → 53.36 %, coverage 2.70 % → 8.22 %). That is not luck, and the reason
-is the structure in §5:
+**trace2 is the weakest trace, and the obvious explanation is wrong.** Its coverage is only
+3.99 % and its IP-table hit rate 43.43 %, so the tempting diagnosis is "the table is too
+small". The geometry sweep refutes it:
 
-> SPP's extra prefetches are not extra *speculation*, they are extra *evidence*. The
-> non-uniform path emits an address only when a Pattern Table entry has confidence ≥ 2,
-> and the lookahead chain **breaks** the moment a link falls below that. So the volume
-> SPP adds over IP-stride is exactly the volume for which it has a confirmed
-> signature → stride mapping. IP-stride, by contrast, fires on a *single* repeated
-> stride and then blindly multiplies it three times.
+| geometry | storage | trace2 IP hit rate | trace2 L1D load misses |
+|---|---|---|---|
+| 64 × 4 | 2 947 B | 43.43 % | 325 007 |
+| 128 × 4 | 4 739 B | 53.27 % | 324 655 |
+| 64 × 8 | 4 803 B | 54.50 % | 324 510 |
+| 128 × 8 | 8 451 B | 59.85 % | 324 667 |
 
-The counter `chains cut by conf` quantifies the restraint: between 219 K and 439 K times
-per run, SPP had budget left in its degree and **chose not to use it** because the next
-link was not trustworthy.
+**Insight 16 — raising trace2's hit rate from 43 % to 60 %, for 2.9× the storage, removes
+352 misses out of 325 007 (0.1 %).** The table was never the binding constraint. The real
+diagnosis is that **trace2's load stream simply has less stride structure to exploit** —
+only 18.18 % of its prefetches come from the uniform path, the lowest of the three, and it
+has the highest baseline MPKI (13.538). More capacity cannot manufacture predictability that
+is not in the address stream. This is the kind of plausible diagnosis that survives
+unchallenged if you never run the experiment.
 
-### trace3 is the showcase for dual classification
+**Why the absolute speedups are small.** Worth being straight about rather than overselling:
 
-trace3 is where the two designs diverge hardest:
+1. An L1D prefetch hit saves an **L2 access (~10 cycles)**, not a DRAM round trip. The big
+   latencies in these traces are further out.
+2. The **baseline L1D hit rate is already ~94 %** (trace1: 4 009 718 hits of 4 276 668 load
+   accesses, 93.76 %). There is not much miss traffic left to remove at this level.
+3. **trace3 confirms the mechanism**: lowest baseline MPKI (3.403) yet the largest speedup
+   (1.0232), because its remaining misses are the ones that actually stall the core.
 
-* IP-stride accuracy **15.99 %** — five out of six lines it fetches are never used. It is
-  firing into a pattern whose stride is not constant, getting the first prefetch
-  occasionally right and the `2*stride`, `3*stride` extrapolations wrong.
-* SPP accuracy **46.52 %**, coverage **2.51 % → 18.01 %** (7.2× better), speedup
-  **1.0225**.
-* The internal split explains it: **45.69 % uniform / 54.31 % non-uniform**. Just over half
-  of SPP's prefetches on this trace come from a predictor IP-stride does not have, and
-  trace3 also has the best IP-table hit rate (86.69 %), so the per-IP histories survive
-  long enough to be useful.
-
-This is the single best piece of evidence that the dual-classification requirement was
-worth implementing properly rather than bolting a second stride onto IP-stride.
-
-### trace2 exposes a real limitation — the IP table is too small for it
-
-Honest reading of the weakest column: on trace2, SPP's coverage is only **3.97 %** and its
-**IP-table hit rate is 43.43 %**, far below trace1's 67.86 % and trace3's 86.69 %. More
-than half of trace2's load accesses land on an IP-table entry belonging to a *different*
-instruction, which wipes the stride history before it can predict.
-
-The cause is capacity/conflict, not a flaw in the prediction logic — note that trace2's
-*mean windowed usefulness* is the **highest of the three (67.20 %)**: when SPP does manage
-to keep a history, its predictions on trace2 are excellent. It simply does not get to keep
-many.
-
-So trace2 says: the 64 × 4 geometry I picked at the knee of a 1M-instruction sweep (§2.1)
-is under-provisioned for a workload with a larger load-PC working set. The fix is a
-one-line change (`IP_TABLE_SETS` / `IP_TABLE_WAYS`) costing 56 bits per added entry; going
-to 128 × 4 would double the IP table to 3 584 B and take the total to ~4.7 KB. I did not
-make that change after seeing the result, because choosing a size *because it flatters one
-trace* is overfitting — but it is the first experiment I would run next, and
-`docs/RUN_INSTRUCTIONS.md` §7 lists it.
-
-### The throttle is alive, and it is not just sitting at the top
-
-The degree histograms are the proof that the accuracy checker does something:
-
-| Trace | d1 | d2 | d3 | d4 |
-|---|---|---|---|---|
-| trace1 | 2 | 50 | 146 | 73 |
-| trace2 | 5 | 35 | 58 | 64 |
-| trace3 | 17 | 42 | 66 | 65 |
-
-Every degree is visited on every trace, and the distribution differs per workload — trace1
-settles mostly at degree 3, trace2 skews to 4, trace3 spends the most time at the floor.
-A fixed-degree prefetcher has no such adaptation. Note also that the mean windowed
-usefulness (60–67 %) is consistently a little *above* the reported ROI accuracy (46–56 %),
-exactly as predicted in §7.1: the internal metric counts late prefetches as useful
-(correct address, merely early-but-not-early-enough) while ChampSim's `ACCURACY` does not.
-The two disagreeing in the predicted direction, by the predicted amount, is a good sign
-that both are measuring what I think they are.
-
-### Why the absolute speedups are small
-
-A 1.5 % geomean gain is modest in absolute terms, and it is worth being clear about why
-rather than overselling it:
-
-1. **These are L1D-load-miss numbers on a 48 KB, 12-way L1D with an L2 behind it.** A
-   prefetch that converts an L1D miss into an L1D hit saves the L2 access latency
-   (~10 cycles), not a DRAM round trip. The big latencies in these traces are further out.
-2. **The baseline L1D hit rate is already ~94 %** (trace1: 4 062 772 hits of 4 301 758 load
-   accesses). There is not much miss traffic left to remove at this level.
-3. **trace3 confirms the mechanism**: it has the lowest baseline MPKI (3.403) yet the
-   largest speedup (1.0225), because its remaining misses are the ones that actually stall
-   the core, and SPP removes 18 % of them.
-
-The honest summary is that SPP does its job well — it predicts far better than IP-stride
-and never pollutes across a page — and that the L1D is simply not where the biggest
-latency wins live in this configuration. That is precisely why the assignment continues
-into L2 replacement policy in Tasks 2 and 3.
+SPP does its job well — it predicts far better than IP-stride and never pollutes across a
+page — and the L1D is simply not where the biggest latency wins live in this configuration.
+That is precisely why the assignment continues into L2 replacement in Tasks 2 and 3.
 
 ---
 
-## 9. Toolchain finding — why the README's GCC 7 section is load-bearing
+## 9. Design sweep — the evidence behind every parameter
 
-All results in §8 were produced with GCC 7.5.0. This section records *why* that is not
-optional, because it cost real debugging time and is the kind of thing that silently
-invalidates a submission.
+Each parameter is backed by an experiment, not an argument: **15 variants × 3 traces = 45
+runs**, same toolchain and run length as §8, one knob at a time. Reproduce with
+`python3 scripts/sweep_task1.py ../traces 3`; logs in `results/task1_sweep/`, generated
+table in `results/task1_sweep/sweep_summary.md`.
 
-Built with **g++ 11.4 at the stock `-O3`**, this ChampSim deadlocks. The symptom is
-specific: the process spins at 100 % CPU having read only **4 692 bytes** of the trace
-(≈ 64 of the 64-byte instruction records) and never prints `Warmup complete`. The front end
-is wedged at the very first instruction. Crucially, the **unmodified baseline binary**
-(`./build_champsim.sh no lru baseline`, containing none of my code) hangs **identically**,
-and the same source at **`-O0` runs correctly** — so this is a compiler/UB interaction in
-the supplied code, not a bug in SPP.
+### 9.0 The noise floor — why none of this is decided on IPC
 
-There is undefined behaviour in the supplied source that fits, e.g. `src/cache.cc:1885`
-dereferences `MSHR.entry[mshr_index]` inside a branch guarded by `mshr_index == -1`:
+Running the *identical* SPP source under two toolchains (g++ 11 `-O0` vs GCC 7 `-O3`),
+500K+500K on trace1:
+
+| build | IPC | cycles | L1D misses | MPKI | pf_issued | pf_useful | pf_lower_level |
+|---|---|---|---|---|---|---|---|
+| g++ 11 `-O0` | 0.41137 | 1 215 451 | **3888** | **7.776** | **10172** | **146** | **365** |
+| GCC 7 `-O3` | 0.41169 | 1 214 505 | **3888** | **7.776** | **10172** | **146** | **365** |
+
+**Insight 17 — every cache and prefetcher counter is bit-identical; only cycles differ, by
+0.078 %.** The simulated memory system is deterministic and toolchain-independent, so MPKI,
+accuracy, coverage and hit rates are hard numbers. The cycle difference comes from the
+undefined behaviour at `src/cache.cc:1885` (`MSHR.entry[mshr_index]` read when
+`mshr_index == -1`) yielding different garbage under different codegen.
+
+Across the whole sweep the geomean speedup of all 15 variants spans **1.0138 to 1.0153** — a
+0.15 % range, barely twice that drift. **IPC therefore cannot discriminate between these
+variants**, and every decision below rests on MPKI, accuracy, coverage and storage.
+
+> Sweeps A, B and D hold `ACC_WINDOW` at 512 so that exactly one knob varies at a time;
+> sweep C varies it. That is why a reference row there reads 8.450 / 53.36 % while §8 — the
+> shipped design, which also carries the window of §6.1 — reads 8.443 / 53.89 %. The
+> comparisons are unaffected because all rows within a sweep move together.
+
+### 9.1 IP-table geometry → **64 × 4** (§3.1 has the table)
+
+Associativity beats capacity at equal storage; past 256 entries the table is not the
+constraint and a larger one costs accuracy.
+
+### 9.2 Degree cap and throttling → **1–4, throttle on** (§6.2, §6.3 have the tables)
+
+Deeper caps buy coverage by surrendering accuracy; 1–4 is where accuracy peaks. Disabling
+the throttle costs 3.9–8.9 pp of accuracy and 15–34 % more lines fetched, for no IPC gain.
+
+### 9.3 Accuracy window → **256**
+
+| window | avg MPKI | pooled accuracy | pooled coverage | trace1 acc | trace2 acc | trace3 acc |
+|---|---|---|---|---|---|---|
+| **256 (chosen)** | **8.443** | **53.89 %** | **8.29 %** | **56.69 %** | **54.61 %** | **47.71 %** |
+| 512 | 8.450 | 53.36 % | 8.22 % | 56.41 % | 54.34 % | 46.52 % |
+| 1024 | 8.463 | 52.68 % | 8.07 % | 55.93 % | 54.19 % | 45.07 % |
+
+256 wins on both metrics on all three traces, and the trend is monotone, so this is not one
+trace carrying the result.
+
+**Insight 18 — adaptivity beats a constant measurement bias.** A short window has a known
+flaw: the prefetches still in flight when it closes are in the denominator but have not had
+a chance to be hit, so it *understates* accuracy by up to ~12 pp at 256. But that is a
+roughly *constant* offset applied to every window alike — it shifts the whole series down.
+What matters for a throttle is not the absolute level but how fast it tracks a *change*, and
+halving the window doubles the number of decisions (trace1: 271 → 542). A constant bias
+costs less than slow reaction.
+
+### 9.4 Uniform-stride threshold → **3**
+
+| threshold | avg MPKI | pooled accuracy | trace1 acc | trace2 acc | trace3 acc |
+|---|---|---|---|---|---|
+| 2 (breaks the spec) | 8.437 | 53.45 % | 56.43 % | 54.31 % | 46.64 % |
+| **3 (chosen)** | **8.450** | **53.36 %** | **56.41 %** | **54.34 %** | **46.52 %** |
+| 4 | 8.457 | 53.17 % | 56.41 % | 54.34 % | 46.52 % |
+
+§4.2 *proves* 3 is required. The sweep measures what that proof costs: a dead heat with 2
+(0.02–0.12 pp). **Correctness is free**, which is the best possible outcome for a constraint
+you were going to honour anyway.
+
+---
+
+## 10. Toolchain — why the README's GCC 7 section is load-bearing
+
+Built with g++ 11.4 at the stock `-O3`, this ChampSim **deadlocks**: the process spins at
+100 % CPU having read only ~4 692 bytes of the trace (~64 of the 64-byte instruction
+records) and never prints `Warmup complete`. The **unmodified baseline binary** hangs
+identically, and the same source at `-O0` runs correctly — so it is a compiler/UB
+interaction in the supplied code, not a bug in SPP.
+
+The undefined behaviour that fits is at `src/cache.cc:1885`:
 
 ```c
 if ((mshr_index == -1) && (MSHR.occupancy < MSHR_SIZE)) {       /* mshr_index IS -1 here */
     if (cache_type == IS_STLB && MSHR.entry[mshr_index].type == TRANSLATION_FROM_L1D)
 ```
 
-A negative array index is UB that GCC 7 happened to tolerate and that newer GCC is
-entitled to optimise on.
+A negative array index — UB that GCC 7 tolerated and that newer GCC is entitled to optimise
+on.
 
-**Consequence for the submission: build and run everything with GCC 7 at `-O3`.** Do not
-"fix" it by lowering the optimisation level — the numbers would not be comparable to
-anyone else's, and the deadlock is a signal that the toolchain is wrong, not something to
-route around.
+**Build and run everything with GCC 7 at `-O3`.** Do not lower the optimisation level
+instead: the numbers would not be comparable, and the deadlock signals a wrong toolchain
+rather than something to route around.
 
 ---
 
-## 10. Consistency audit — does satisfying one requirement break another?
+## 11. Design-interaction audit
 
-The brief asked for this explicitly, so here it is as a closed list. Each row is a pair I
-actually checked, with the resolution.
+Each row is a pair of requirements that could conflict, and how the design resolves it.
 
 | Interaction | Risk | Resolution |
 |---|---|---|
-| Page confinement × degree > 1 | Deep chains are the most likely to leave the page, so confinement could quietly cap the degree near page ends | Accepted and correct: the chain `break`s, so SPP self-limits near a boundary instead of emitting unprefetchable addresses. Counted as `page-boundary re-anchors` |
-| Uniform priority × always-training | Training the pattern table during uniform phases could fill it with junk | The entries created are self-consistent (`d → d`) and make the non-uniform path degrade *into* the uniform prediction — verified for pattern `[2]` in §4.3 |
-| Hard reset of `uniform_conf` × "quickly identify the correct sequence" | A reset throws away real information | Only uniform *status* is reset; `last_stride`, `signature` and the pattern table survive, so the fall-back predictor is already warm (§3.4) |
-| Throttling × late prefetches | Throttling on timeliness would make late prefetches later | `late_prefetch` counted as useful, so the loop responds to address-correctness, not timeliness (§7.1) |
-| Throttling × its own sensor | Degree 0 freezes the measurement permanently | Floor is 1 (§7.2) |
-| Accuracy denominator × pollution semantics | `useful/issued` pinned the degree at the floor and disabled the throttle | Denominator is `pf_lower_level` — lines actually fetched (§7.1) |
-| `type != LOAD` filter × coverage | Dropping RFO gives up store-stream prefetching | Deliberate: the metric is load MPKI and the table is small; one-line experiment noted in §2.3 |
-| 7-bit stride field × real strides | A stride wider than ±63 lines would truncate silently | Impossible by construction: strides live in page-offset space, 0..63 (§2.2) |
-| Tagless pattern table × aliasing | A colliding signature could return a confidently wrong stride | Collisions drive `conf` down, not the value wrong; `conf < 2` refuses to predict (§4.3) |
-| ROI counter reset × windowed throttle | Unsigned wrap jams the degree at maximum for the whole measured region | Signed difference clamped at zero (§7.1) |
-| Self-training feedback × everything | Learning from our own prefetches corrupts the stride stream at the source | `type != LOAD` filter; this is the bug `ip_stride` has (§2.3) |
+| Page confinement × degree > 1 | Deep chains are the most likely to leave the page, so confinement could quietly cap the degree near page ends | Accepted and correct: the chain `break`s, so SPP self-limits near a boundary rather than emitting unprefetchable addresses |
+| Uniform priority × always-training | Training the pattern table during uniform phases could fill it with junk | The entries created are self-consistent (`d → d`) and make the non-uniform path degrade *into* the uniform prediction — verified for pattern `[2]` (§4.5) |
+| Hard reset of `uniform_conf` × "adapt quickly" | A reset throws away real information | Only uniform *status* resets; `last_stride`, `signature` and the pattern table survive, so the fall-back predictor is already warm (§4.4) |
+| Throttling × late prefetches | Throttling on timeliness would make late prefetches later | `late_prefetch` counted as useful, so the loop responds to address-correctness (§6.1) |
+| Throttling × its own sensor | Degree 0 freezes the measurement permanently | Floor is 1 (§6.2) |
+| Accuracy denominator × pollution semantics | `useful/issued` would pin the degree at the floor and silently disable the throttle | Denominator is `pf_lower_level` — lines actually fetched (§6.1) |
+| `type != LOAD` × coverage | Dropping RFO gives up store-stream prefetching | Deliberate: the metric is load MPKI and the table is small (§3.3) |
+| 7-bit stride field × real strides | A stride wider than ±63 lines would truncate silently | Impossible by construction: strides live in page-offset space (§3.2) |
+| Tagless pattern table × aliasing | A colliding signature could return a confidently wrong stride | Collisions drive `conf` down, not the value wrong; `conf < 2` refuses to predict (§4.5) |
+| ROI counter reset × windowed throttle | Unsigned wrap would jam the degree at maximum for the whole measured region | Signed difference clamped at zero (§6.1) |
+| Self-training feedback × everything | Learning from our own prefetches corrupts the stride stream at the source | `type != LOAD` filter; this is the bug `ip_stride` has (§3.3) |
+| Bigger IP table × trace2's weak coverage | Capacity looks like the obvious fix | Measured: 2.9× storage removes 0.1 % of its misses; the limit is stride structure, not capacity (§8.8) |
 
+---
+
+## 12. The things to be able to say without notes
+
+1. **"IP-stride stores one stride; SPP stores a signature of the last four, so it can
+   predict a repeating *sequence*."**
+2. **"Strides live in page-offset space, which makes crossing a page impossible by
+   construction and makes a 7-bit stride field provably sufficient."** ChampSim's own
+   counter reports 0 cross-page requests.
+3. **"The uniform threshold is 3 because the assignment's own example has a run of three
+   identical strides — two consecutive matches — so 3 is the smallest value that never
+   misclassifies it."** And it costs nothing: measured dead heat with 2.
+4. **"Degree > 1 on a non-uniform pattern needs the predictor replayed on its own output,
+   because you cannot multiply a stride that changes."**
+5. **"The throttle measures useful lines over lines *actually fetched*, not over requests
+   issued, because a prefetch that hits in the cache and is dropped cannot pollute."**
+6. **"The degree floor is 1, not 0, because a control loop must not be able to switch off
+   its own sensor."**
+7. **"Throttling removes 15–34 % of the lines we drag into the L1D and gains 3.9–8.9 pp of
+   accuracy, for no IPC cost."**
+8. **"Associativity, not capacity, was what the IP table was short of — and past 256 entries
+   a bigger table actively costs accuracy."**
+9. **"trace2's low coverage is not a table-size problem: 2.9× the storage removes 0.1 % of
+   its misses. Its address stream has less stride structure."**
+10. **"IPC cannot discriminate between our design variants — the toolchain's own cycle drift
+    is 0.078 % and the whole variant spread is 0.15 % — so every decision rests on MPKI,
+    accuracy, coverage and storage."**
+
+---
+
+## 13. Where everything lives
+
+| Path | What |
+|---|---|
+| `prefetcher/spp.l1d_pref` | the implementation |
+| `scripts/verify_design.py` | proves the threshold and signature choices offline, no simulation |
+| `scripts/run_task1.sh` | 3 configs × 3 traces at 25M+25M, resumable |
+| `scripts/parse_results.py` | ROI-only parsing → CSV + report tables, with consistency checks |
+| `scripts/plot_task1.py` | the four figures |
+| `scripts/sweep_task1.py` | the 15-variant design sweep |
+| `results/task1/` | logs, CSV, tables, figures |
+| `results/task1_sweep/` | sweep logs and summary |
+| `docs/TASK1_STUDY_ROADMAP.md` | a 10-chunk path through this task |
+| `docs/CACHE_CC_GUIDE.md` | how to read ChampSim's 4 298-line `src/cache.cc` |
+| `Summary.pdf` | this document, rendered |

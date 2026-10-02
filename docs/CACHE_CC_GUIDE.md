@@ -189,10 +189,13 @@ is *virtual*, and the physical address only exists after translation. That is wh
 line 480 to recover a virtual address. For Task 1 this is good news — strides and page
 boundaries are naturally virtual.
 
-**`prefetch_line()` can silently fail.** It returns 0 when `PQ.occupancy == PQ.SIZE`. If
-you ignore the return value you will never know your deepest prefetches were thrown away.
-`L1D_PQ_SIZE` is 16 (`inc/cache.h:88`), which is one of the three reasons SPP caps its
-degree at 4.
+**`prefetch_line()` can silently fail.** It returns 0 when `PQ.occupancy == PQ.SIZE`
+(`L1D_PQ_SIZE` is 16, `inc/cache.h:88`). If you ignore the return value you will never know
+your deepest prefetches were thrown away — so read `DROPPED PREFETCHES` in the stats rather
+than assuming. For SPP it is **0 in all 45 sweep runs, even at degree 8**: the PQ drains
+every cycle in `handle_prefetch()` and the lookahead chain breaks on confidence long before
+the degree cap binds, so the queue never fills. Queue size is therefore *not* what limits
+SPP's degree — accuracy is (`docs/TASK1_SPP.md` §6.2).
 
 **There is real undefined behaviour in the file.** Line 1885:
 
