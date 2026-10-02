@@ -125,7 +125,7 @@ miss that is later serviced.
    * `l1d_prefetcher_cache_fill(...)` (line ~504)
    * `update_replacement_state(..., hit = 0)` (line **527**) ← Task 2's **insertion**
    * `fill_cache()` (2859), which sets
-     `block[set][way].prefetch = (packet->type == PREFETCH) ? 1 : 0` (line **2917**) and
+     `block[set][way].prefetch = (packet->type == PREFETCH) ? 1 : 0` (line **2918**) and
      `used = 0`
    * if the block being evicted was a prefetch that was never used → `pf_useless++`
      (line **2913**)
@@ -215,7 +215,7 @@ at zero or the unsigned wrap will jam your logic (SPP does this — see `spp.l1d
 section (1)).
 
 **`DEADLOCK_CYCLE` assert.** If a PQ entry is not serviced for too long, `operate()` aborts
-with a `DEADLOCK` message (line 2830). If you see that, you have flooded the PQ.
+with a `DEADLOCK` message (line 2832). If you see that, you have flooded the PQ.
 
 ---
 
