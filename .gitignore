@@ -1,0 +1,9 @@
+bin/
+obj/
+*.o
+*.d
+*.bak
+traces/
+
+__pycache__/
+*.pyc
