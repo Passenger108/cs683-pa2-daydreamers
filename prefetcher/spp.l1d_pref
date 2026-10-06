@@ -26,9 +26,9 @@ is trusted.
 #define PATTERN_CONF_PREDICT  2       // predict only when conf >= 2
 
 // Accuracy based throttling.
-#define MAX_DEGREE            4
+#define MAX_DEGREE            8
 #define MIN_DEGREE            1
-#define ACC_WINDOW            256     // re-evaluate every 256 lines actually fetched
+#define ACC_WINDOW            100     // re-evaluate every 256 lines actually fetched
 
 
 // --------------------------- the two tables --------------------------------
@@ -154,10 +154,10 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         if(acc > 100) 
             acc = 100;
 
-        if(acc >= 75)
-            spp_degree = 4;
+        if(acc >= 66)
+            spp_degree = 8;
         else if(acc >= 50) 
-                spp_degree = 3;
+                spp_degree = 4;
             else if(acc >= 25) 
                     spp_degree = 2;
                 else
@@ -265,7 +265,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         uint64_t pf_addr = (addr & ~((uint64_t)PAGE_SIZE - 1))
                          | ((uint64_t)pf_offset << LOG2_BLOCK_SIZE);
 
-        if (MSHR.occupancy < (MSHR.SIZE >> 1))
+        if (MSHR.occupancy < (MSHR.SIZE * 0.75))
             prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
         else
             prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
