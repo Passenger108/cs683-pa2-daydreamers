@@ -29,7 +29,7 @@ Already done, nothing for you to run:
 | | |
 |---|---|
 | `update_replacement_state` extended with `uint8_t isInstruction` | 28 declarations + 6 call sites in `src/cache.cc` |
-| `replacement/irrip.l2c_repl` written | 521 lines, all knobs in one block at the top |
+| `replacement/irrip.l2c_repl` written | 252 lines, all knobs in one block at the top |
 | `replacement/rrip.l2c_repl` now builds | it never could before — that was the build break the PDF warned about |
 | `scripts/run_task2a.sh`, `parse_task2a.py`, `plot_task2a.py`, `sweep_task2a.py` | written and syntax-checked |
 | `scripts/verify_task2a.py` | self-audit: checks the docs' claims against the source and the logs |

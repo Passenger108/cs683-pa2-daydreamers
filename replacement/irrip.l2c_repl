@@ -1,139 +1,44 @@
 #include "cache.h"
 
-/*============================================================================
- *  I-RRIP  --  Instruction-Conscious RRIP for the L2 cache        (PA2 Task 2a)
- *============================================================================
+/*  I-RRIP -- instruction-conscious RRIP for the L2                PA2 Task 2a
  *
- *  WHAT PROBLEM THIS SOLVES
- *  ------------------------
- *  On server-style workloads the instruction footprint spills out of the L1I,
- *  so the L2 has to serve instruction fetches as well as data.  Measured on the
- *  three supplied traces with the stock L2 policy (LRU, no prefetcher), the L2
- *  load miss stream is dominated by instructions:
+ *  Behaviourally this is replacement/rrip.l2c_repl (SRRIP) with the insertion
+ *  and promotion values made type-aware. The whole policy is:
  *
- *      trace    L2C load MPKI    of which instruction    of which data
- *      trace1       17.70              10.34  (58%)         7.36
- *      trace2       27.36              18.85  (69%)         8.50
- *      trace3        3.95               1.12  (28%)         2.83
+ *      an instruction line gets one aging round of protection;
+ *      a data line never rises above evict-next.
  *
- *  and a large share of the instruction lines that get thrown out are thrown
- *  out by a *data* fill (ChampSim already counts this for us -- see the
- *  "L2C Data Evicting Instructions" line in the simulator's own output):
+ *  Why that is the right shape, why eviction is left alone, the 26-variant
+ *  sweep that chose these values, and the three predictions it refuted are all
+ *  in docs/TASK2A_DESIGN_DECISIONS.md -- deliberately there and not here, so
+ *  this file stays short enough to read in one sitting.
  *
- *      trace    instruction victims    killed by a data fill
- *      trace1       257 967               120 225   (46.6%)
- *      trace2       462 640               136 147   (29.4%)
- *      trace3        30 733                19 415   (63.2%)
- *
- *  That last column is the headroom this policy is aiming at.
- *
- *
- *  THE THESIS, AND WHERE THE SWEEP CORRECTED IT
- *  --------------------------------------------
- *  RRIP funnels every input it has through a single per-line number, the RRPV.
- *  So there are exactly three places a type hint can enter: the value written
- *  at INSERTION, the value written at PROMOTION, and the way the victim scan
- *  READS those values.
- *
- *  My argument before measuring was: put the bias in INSERTION only, because
- *  insertion is the one hook that makes a *prediction about a line we know
- *  nothing about*, and leave promotion and eviction alone.  A 26-variant
- *  sweep (78 runs, GCC 7, 25M warmup + 25M sim) refuted half of that:
- *
- *    INSERTION  - confirmed, and pushed harder than I proposed: data lines now
- *                 insert AT the eviction edge, not at SRRIP's max-1.
- *    PROMOTION  - REFUTED.  I argued a hit is evidence and must not be
- *                 overruled by a type prior.  Weakening data promotion wins
- *                 anyway, on every metric.  iTP (ASPLOS'25) was right.
- *    EVICTION   - argument survives here, but only just.  A bounded eviction
- *                 preference also helps, and was the best regression-free
- *                 variant; it is not used because the configuration below
- *                 beats it on the assignment's stated objective AND on IPC,
- *                 at a third of the storage.
- *
- *  docs/TASK2A_DESIGN_DECISIONS.md carries the full argument, the measured
- *  refutations, and why this configuration was chosen over the alternative.
- *
- *  Reference point: replacement/rrip.l2c_repl, the SRRIP the handout ships.
- *  Set every knob to its "RRIP" column below and this file reproduces it
- *  exactly -- which is what makes the I-RRIP-vs-RRIP comparison meaningful.
- *
- *      knob                      RRIP          I-RRIP (shipped)
- *      IRRIP_MAX_RRPV            3             1     1-bit RRPV -> 1 KB total
- *      IRRIP_INSERT_INSTR        2 (= max-1)   0     one aging round of grace
- *      IRRIP_INSERT_DATA         2 (= max-1)   1     = max, i.e. evict-next
- *      IRRIP_INSERT_TRANSL       2 (= max-1)   1     treated as data
- *      IRRIP_PROMOTE_INSTR       0             0     a hit resets to the top
- *      IRRIP_PROMOTE_DATA        0             1     = max: weakened
- *      IRRIP_PROMOTE_TRANSL      0             0
- *      IRRIP_EVICT_PREFER_DATA   0             0     eviction untouched
- *      IRRIP_WB_PROMOTES         1             1
- *
- *  Read together, the shipped configuration says something very simple:
- *  **a data line never rises above evict-next, and an instruction line gets
- *  exactly one aging round of protection.**  With a 1-bit RRPV there is no
- *  room for anything subtler -- and on these traces nothing subtler was
- *  needed: this was the cheapest configuration tested (1024 B, one third of
- *  the LRU it replaces) and it had the best IPC of all 26 variants.
- *
- *  Storage: see l2c_replacement_final_stats() at the bottom, which prints the
- *  bit-level accounting for whatever configuration was actually compiled.
- *============================================================================*/
+ *  The one number worth carrying while reading the code: in this L2 a data
+ *  line is re-referenced 0.13 times per fill, an instruction line 0.54-3.06
+ *  times. The policy is not a preference for instructions; it is those two
+ *  reuse rates, encoded.                                     (design doc 14.2)
+ */
 
+/* ------------------------------- knobs ---------------------------------- *
+ * scripts/sweep_task2a.py rewrites exactly these lines and nothing else.
+ * The #ifndef wrappers also allow -DIRRIP_X=n from the compiler.           */
 
-/*----------------------------------------------------------------------------
- *  KNOBS
- *
- *  Everything tunable lives in this block and nowhere else, so
- *  scripts/sweep_task2a.py can rewrite one "#define" line and rebuild without
- *  having to understand any of the logic underneath.  The #ifndef wrappers let
- *  a value also be forced from the compiler command line with -D.
- *--------------------------------------------------------------------------*/
-
-/* Top of the RRPV range.  An n-bit RRPV gives IRRIP_MAX_RRPV = 2^n - 1, so the
- * storage-meaningful settings are 1 (1 bit), 3 (2 bits) and 7 (3 bits); values
- * 2, 4, 5 and 6 work but pay for a bit they do not use.
- *
- * Why not 0, which the range "0-7" would suggest?  With a maximum of 0 every
- * line is inserted at 0 and 0 is also the evict-now value, so there is no room
- * left to say that one line matters more than another -- the policy collapses
- * into "always replace the lowest-numbered way".  1 is the smallest maximum
- * that can still express a priority, so the sweep starts there. */
-/* Measured: 1 wins.  The sweep tested 1, 3 and 7; the 1-bit RRPV was both the
- * cheapest (1024 B against 2048 and 3072) and the strongest on instruction
- * MPKI once data insertion and promotion were set to match it.  Mildly
- * counter-intuitive, since a wider RRPV can express more -- but with only two
- * classes to separate there is nothing for the extra states to say, while a
- * wider range means a longer aging loop and therefore a staler set.  Jaleel et
- * al. found 2 bits enough for general reuse prediction; a 1-bit type
- * preference needs less still. */
+/* Top of the RRPV range; an n-bit RRPV gives 2^n - 1. Shipped at 1 (one bit,
+ * 1 KB) because the sweep found nothing for wider states to express when
+ * there are only two classes to separate. 0 is excluded: insertion and
+ * evict-now would be the same value, leaving no priority to express. */
 #ifndef IRRIP_MAX_RRPV
 #define IRRIP_MAX_RRPV 1
 #endif
 
-/* INSERTION: the RRPV handed to a freshly filled line of each class.
- *
- * Read an insertion value as a protection budget.  A line inserted at r cannot
- * be chosen as a victim until its set has been aged (IRRIP_MAX_RRPV - r) times,
- * so a *smaller* number buys *more* time to prove it is worth keeping.  That is
- * the entire mechanism: instruction lines are given a bigger budget than data
- * lines, and then have to earn their keep like everyone else. */
+/* Insertion = a protection budget in aging rounds: a line at r survives
+ * (IRRIP_MAX_RRPV - r) aging passes before it can be chosen as victim. */
 #ifndef IRRIP_INSERT_INSTR
 #define IRRIP_INSERT_INSTR 0
 #endif
-/* Data and translation lines insert AT the maximum, i.e. evict-next.
- *
- * Stronger than SRRIP's max-1, and stronger than I originally proposed.  I had
- * argued for keeping SRRIP's value so that I-RRIP's gain came from
- * *protecting instructions* rather than *penalising data* -- a cleaner claim,
- * because it is attributable.  The sweep showed the cleaner claim is also the
- * weaker policy: instruction misses are ~62% of the baseline L2 load miss
- * stream here, and every knob trades at roughly 0.5 data misses gained per
- * instruction miss saved, so the trade is worth making almost without limit.
- *
- * Written as IRRIP_MAX_RRPV, not as (IRRIP_MAX_RRPV - 1): at MAX_RRPV == 1
- * that expression is 0, which would make data insertion identical to
- * instruction insertion -- silently no bias at all. */
+/* Written as IRRIP_MAX_RRPV, not (IRRIP_MAX_RRPV - 1): at max == 1 that
+ * expression is 0, which would silently equal the instruction value and leave
+ * no bias at all. */
 #ifndef IRRIP_INSERT_DATA
 #define IRRIP_INSERT_DATA IRRIP_MAX_RRPV
 #endif
@@ -141,33 +46,14 @@
 #define IRRIP_INSERT_TRANSL IRRIP_MAX_RRPV
 #endif
 
-/* PROMOTION: the RRPV written when an already-resident line is hit.
- *
- * 0 is SRRIP's answer and means "a hit resets the line to maximum priority".
- * A value above 0 deliberately weakens promotion for that class, which is what
- * iTP (ASPLOS'25) does to data entries.  Defaults keep all three at 0 so that
- * the default I-RRIP differs from the shipped RRIP in insertion *only* -- the
- * sweep then measures whether weakening data promotion is worth it. */
+/* Promotion = the RRPV written when a resident line is hit. 0 is SRRIP's
+ * answer. Data is weakened to the edge: at 0.13 hits per fill an L2 data hit
+ * means "referenced twice", not "hot", so the hit is honoured by the line
+ * surviving this eviction and nothing more. I argued the opposite before
+ * measuring and was wrong (design doc 14.3). */
 #ifndef IRRIP_PROMOTE_INSTR
 #define IRRIP_PROMOTE_INSTR 0
 #endif
-/* Data promotion is WEAKENED -- the one decision the measurement reversed.
- *
- * My argument: insertion is a prediction, promotion is a response to evidence.
- * A hit is the cache being *told* a line is being re-referenced, and letting a
- * static type prior overrule that is letting a guess beat a fact.  I added
- * that L2 load hit rates here are only 28-49%, so hits are scarce and scarce
- * evidence should be weighted up, not discounted.
- *
- * The sweep disagreed on every metric -- instruction MPKI, total L2C MPKI and
- * IPC all improved.  iTP (ASPLOS'25), which does exactly this, was right.
- *
- * Why, in hindsight: an L2 data hit is evidence of "re-referenced at least
- * once", not of "hot".  Resetting such a line to the top of the set spends a
- * way that an instruction line would have used more productively.  At
- * MAX_RRPV == 1 the weakened value is 1, so a data hit leaves the line still
- * at evict-next: the hit is honoured by the line surviving THIS eviction, and
- * nothing further is promised. */
 #ifndef IRRIP_PROMOTE_DATA
 #define IRRIP_PROMOTE_DATA IRRIP_MAX_RRPV
 #endif
@@ -175,16 +61,10 @@
 #define IRRIP_PROMOTE_TRANSL 0
 #endif
 
-/* EVICTION: off by default, i.e. the victim scan is exactly RRIP's.
- *
- * When switched on, the scan will pass over an instruction line in favour of a
- * non-instruction line that is at or within IRRIP_EVICT_SLACK of the eviction
- * edge.  SLACK = 0 means "same candidates RRIP would have considered, just
- * prefer a data one among them"; SLACK > 0 means "willing to evict a data line
- * that is not yet due, in order to spare an instruction line that is".  The
- * slack is what keeps this a bounded preference rather than an absolute veto,
- * following xPTP (ASPLOS'25), which only diverts a victim while the
- * alternative stays within K positions of the real one. */
+/* Eviction: off by default, so the victim scan is a pure function of the RRPV
+ * and the RRPV stays the complete summary of a line's priority. When on, the
+ * scan passes over an instruction line if some non-instruction line is within
+ * SLACK of the edge -- xPTP's bounded diversion rather than an absolute veto. */
 #ifndef IRRIP_EVICT_PREFER_DATA
 #define IRRIP_EVICT_PREFER_DATA 0
 #endif
@@ -192,83 +72,46 @@
 #define IRRIP_EVICT_SLACK 0
 #endif
 
-/* Does a writeback that hits in the L2 count as a reference worth promoting?
- *
- * Kept at 1 because that is what the shipped rrip.l2c_repl does, and holding it
- * identical is what makes "I-RRIP minus RRIP" isolate instruction-consciousness
- * instead of mixing in a second, unrelated change.  Note the stock LRU policy
- * takes the opposite view ("writeback hit does not update LRU state"), so this
- * is a genuine open question -- which is why it is a knob and gets swept. */
+/* Does a writeback hit promote? Held at rrip.l2c_repl's answer (yes) so that
+ * "I-RRIP minus RRIP" isolates instruction-consciousness and nothing else. */
 #ifndef IRRIP_WB_PROMOTES
 #define IRRIP_WB_PROMOTES 1
 #endif
 
-/* Catch a nonsensical sweep value at compile time instead of letting it quietly
- * produce a number that looks like a result. */
-static_assert(IRRIP_MAX_RRPV >= 1 && IRRIP_MAX_RRPV <= 7,
-              "IRRIP_MAX_RRPV must be 1..7");
-static_assert(IRRIP_INSERT_INSTR  >= 0 && IRRIP_INSERT_INSTR  <= IRRIP_MAX_RRPV,
-              "IRRIP_INSERT_INSTR out of range");
-static_assert(IRRIP_INSERT_DATA   >= 0 && IRRIP_INSERT_DATA   <= IRRIP_MAX_RRPV,
-              "IRRIP_INSERT_DATA out of range");
-static_assert(IRRIP_INSERT_TRANSL >= 0 && IRRIP_INSERT_TRANSL <= IRRIP_MAX_RRPV,
-              "IRRIP_INSERT_TRANSL out of range");
-static_assert(IRRIP_PROMOTE_INSTR  >= 0 && IRRIP_PROMOTE_INSTR  <= IRRIP_MAX_RRPV,
-              "IRRIP_PROMOTE_INSTR out of range");
-static_assert(IRRIP_PROMOTE_DATA   >= 0 && IRRIP_PROMOTE_DATA   <= IRRIP_MAX_RRPV,
-              "IRRIP_PROMOTE_DATA out of range");
-static_assert(IRRIP_PROMOTE_TRANSL >= 0 && IRRIP_PROMOTE_TRANSL <= IRRIP_MAX_RRPV,
-              "IRRIP_PROMOTE_TRANSL out of range");
-/* A slack of IRRIP_MAX_RRPV would make the preference pass match every way in
- * the set, turning the policy into "evict any data line, always". */
+/* Reject a nonsensical sweep value at compile time rather than let it produce
+ * a number that looks like a result. SLACK must stay below MAX_RRPV or the
+ * preference pass matches every way in the set. */
+static_assert(IRRIP_MAX_RRPV >= 1 && IRRIP_MAX_RRPV <= 7, "IRRIP_MAX_RRPV must be 1..7");
+static_assert(IRRIP_INSERT_INSTR  >= 0 && IRRIP_INSERT_INSTR  <= IRRIP_MAX_RRPV &&
+              IRRIP_INSERT_DATA   >= 0 && IRRIP_INSERT_DATA   <= IRRIP_MAX_RRPV &&
+              IRRIP_INSERT_TRANSL >= 0 && IRRIP_INSERT_TRANSL <= IRRIP_MAX_RRPV,
+              "an IRRIP_INSERT_* value is outside 0..IRRIP_MAX_RRPV");
+static_assert(IRRIP_PROMOTE_INSTR  >= 0 && IRRIP_PROMOTE_INSTR  <= IRRIP_MAX_RRPV &&
+              IRRIP_PROMOTE_DATA   >= 0 && IRRIP_PROMOTE_DATA   <= IRRIP_MAX_RRPV &&
+              IRRIP_PROMOTE_TRANSL >= 0 && IRRIP_PROMOTE_TRANSL <= IRRIP_MAX_RRPV,
+              "an IRRIP_PROMOTE_* value is outside 0..IRRIP_MAX_RRPV");
 static_assert(IRRIP_EVICT_SLACK >= 0 && IRRIP_EVICT_SLACK < IRRIP_MAX_RRPV,
               "IRRIP_EVICT_SLACK must be 0..IRRIP_MAX_RRPV-1");
-/* The two switches are booleans.  IRRIP_WB_PROMOTES in particular is read in an
- * ordinary `if`, so without this check a stray value like 5 would quietly behave
- * as 1 rather than being rejected -- exactly the kind of silent mis-configuration
- * the self-audit in scripts/verify_task2a.py exists to catch. */
-static_assert(IRRIP_WB_PROMOTES == 0 || IRRIP_WB_PROMOTES == 1,
-              "IRRIP_WB_PROMOTES must be 0 or 1");
-static_assert(IRRIP_EVICT_PREFER_DATA == 0 || IRRIP_EVICT_PREFER_DATA == 1,
-              "IRRIP_EVICT_PREFER_DATA must be 0 or 1");
+static_assert((IRRIP_WB_PROMOTES == 0 || IRRIP_WB_PROMOTES == 1) &&
+              (IRRIP_EVICT_PREFER_DATA == 0 || IRRIP_EVICT_PREFER_DATA == 1),
+              "IRRIP_WB_PROMOTES and IRRIP_EVICT_PREFER_DATA are 0 or 1");
 
+/* ------------------------------- state ---------------------------------- */
 
-/*----------------------------------------------------------------------------
- *  STATE
- *--------------------------------------------------------------------------*/
+uint8_t  l2_irrip_rrpv[L2C_SET][L2C_WAY];   /* the only per-line state      */
+uint64_t irrip_insert[3], irrip_promote[3]; /* stats only; never a decision */
+uint64_t irrip_wb_skipped, irrip_evict_pref, irrip_age_rounds;
 
-/* One RRPV per cache line.  uint8_t in the model; the real cost is
- * ceil(log2(IRRIP_MAX_RRPV+1)) bits, accounted for at the bottom of this file. */
-uint8_t l2_irrip_rrpv[L2C_SET][L2C_WAY];
-
-/* Counters, for the write-up only -- they do not feed any decision. */
-uint64_t irrip_insert[3];     /* fills, by class                               */
-uint64_t irrip_promote[3];    /* hits that promoted, by class                  */
-uint64_t irrip_wb_skipped;    /* writeback hits ignored (IRRIP_WB_PROMOTES==0) */
-uint64_t irrip_evict_pref;    /* times the eviction preference changed the victim */
-uint64_t irrip_age_rounds;    /* set-aging passes, i.e. how hard the scan works */
-
-
-/*----------------------------------------------------------------------------
- *  CLASSIFY  --  which of the three kinds of L2 line is this?
- *
- *  Deliberately the same three-way split that src/cache.cc already uses in
- *  handle_fill() for its "fill_packet_type" variable (1 = translation,
- *  2 = instruction, 3 = data).  Matching it means my three classes line up
- *  one-for-one with the nine "<X> Evicting <Y>" counters the simulator prints,
- *  so the statistics can be used directly as evidence about this policy
- *  instead of having to be reinterpreted.
- *
- *  Order matters: translations are tested first, because a page-walk packet for
- *  an instruction page arrives with packet.instruction == 1 and would otherwise
- *  be filed as an instruction line.  It is not one -- it holds page-table data
- *  on the way to an instruction fetch -- and ChampSim agrees: fill_cache() sets
- *  block.translation on it and leaves block.instruction at 0.
- *--------------------------------------------------------------------------*/
 #define IRRIP_TRANSL 0
 #define IRRIP_INSTR  1
 #define IRRIP_DATA   2
 
+/* Translations are tested FIRST: an instruction page walk arrives with
+ * packet.instruction == 1 but is not an instruction line -- it is page-table
+ * data on the way to one, and fill_cache() agrees (block.translation, not
+ * block.instruction). The three classes are byte-for-byte those of
+ * fill_packet_type in src/cache.cc:60, so they line up 1:1 with the nine
+ * "<X> Evicting <Y>" counters the simulator already prints. */
 static inline int irrip_class(uint32_t type, uint8_t isInstruction)
 {
     if (type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION || type == TRANSLATION_FROM_L1D)
@@ -292,22 +135,20 @@ static inline uint8_t irrip_promote_rrpv(int cls)
     return IRRIP_PROMOTE_DATA;
 }
 
-
-/*----------------------------------------------------------------------------
- *  INITIALISE
- *--------------------------------------------------------------------------*/
 void CACHE::l2c_initialize_replacement()
 {
+    /* Every way starts at the edge, which is also why find_victim needs no
+     * invalid-line check: an untouched way already reads as "evict me". */
     for (int i = 0; i < L2C_SET; i++)
         for (int j = 0; j < L2C_WAY; j++)
-            l2_irrip_rrpv[i][j] = IRRIP_MAX_RRPV;   /* see note in find_victim */
+            l2_irrip_rrpv[i][j] = IRRIP_MAX_RRPV;
 
     for (int c = 0; c < 3; c++) { irrip_insert[c] = 0; irrip_promote[c] = 0; }
-    irrip_wb_skipped = 0; irrip_evict_pref = 0; irrip_age_rounds = 0;
+    irrip_wb_skipped = irrip_evict_pref = irrip_age_rounds = 0;
 
-    /* Print the configuration into the run's own log.  Every number this policy
-     * produces is therefore self-describing: the sweep parser reads the knobs
-     * back out of the log rather than trusting a filename to be right. */
+    /* Every run's log is self-describing, and the sweep reads this line back
+     * rather than trusting a filename -- the check that caught a stale binary
+     * reporting a different I-RRIP's numbers as ours. */
     cout << NAME << " I-RRIP config"
          << "  MAX_RRPV " << IRRIP_MAX_RRPV
          << " | INSERT instr " << IRRIP_INSERT_INSTR
@@ -322,187 +163,77 @@ void CACHE::l2c_initialize_replacement()
          << endl;
 }
 
-
-/*----------------------------------------------------------------------------
- *  EVICTION  --  pick the victim way
- *
- *  Unchanged from RRIP in the shipped configuration, and that is a decision,
- *  not an oversight -- though the sweep made it a closer call than the argument
- *  below implies.  Switching the preference on (IRRIP_EVICT_PREFER_DATA, below)
- *  does help, and `ev_s0` was the best variant that regressed no single trace.
- *  It is off here because the chosen configuration beats it on instruction
- *  MPKI, on IPC and on storage, and because keeping eviction a pure function of
- *  the RRPV is what lets Task 2b duel two policies that differ in one number.
- *  The prediction that it "would change almost nothing" was wrong, and §14.3 of
- *  the design document explains why: insertion delays the decision but does not
- *  inform it, so the two mechanisms act at different moments.
- *  In RRIP the RRPV *is* the priority: it is the single number that insertion
- *  writes, promotion updates, and eviction reads.  If eviction consults the
- *  instruction bit as well, then type influences the outcome through two
- *  separate channels and the RRPV stops being a complete summary of what the
- *  policy believes about a line -- which is the one property that makes RRIP
- *  possible to reason about.  Worse, it double-counts: an instruction line
- *  inserted at 0 already reaches the eviction edge later than a data line
- *  inserted at 2, so the preference is *already in the numbers*.  Reading the
- *  type again here applies the same bias twice.
- *
- *  Note also that a hard "never evict an instruction line while a data line is
- *  available" would disable itself exactly where it is needed most: on trace2,
- *  56% of L2 victims are instruction lines, so sets in which all eight ways
- *  hold instructions are common, and in those sets there is no data line to
- *  divert to.  The mechanism would be absent from the hottest sets.
- *
- *  So the preference is a knob, defaulting to off, and the sweep decides.  Its
- *  slack parameter is what makes the switched-on version defensible: a bounded
- *  diversion, as in xPTP, rather than an absolute veto.
- *--------------------------------------------------------------------------*/
+/* Victim selection. The two loops below are plain RRIP, unchanged: take anyone
+ * at the edge, else age the whole set and look again. Aging moves protected
+ * lines too, so protection is a longer deadline and never an exemption --
+ * which is what makes insertion-based prioritisation unable to starve data. */
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
     while (1)
     {
 #if IRRIP_EVICT_PREFER_DATA
-        /* Optional first pass: spare an instruction line if some non-instruction
-         * line is close enough to the edge to take its place.  block.instruction
-         * is maintained by fill_cache() for the L2C already, so this costs no
-         * extra state.  An invalid way reads as instruction == 0 and so is
-         * preferred here too, which is what we want. */
+        /* Compiled out by default. block.instruction is already maintained for
+         * the L2C, so this costs no extra state; an invalid way reads as 0 and
+         * is preferred here too, which is what we want. */
         for (int i = 0; i < L2C_WAY; i++)
             if (l2_irrip_rrpv[set][i] + IRRIP_EVICT_SLACK >= IRRIP_MAX_RRPV
                 && current_set[i].instruction == 0)
-            {
-                irrip_evict_pref++;
-                return i;
-            }
+            { irrip_evict_pref++; return i; }
 #endif
-
-        /* Plain RRIP: the first way that has aged all the way to the edge.
-         *
-         * This also handles the cold cache without needing a separate
-         * invalid-line check: initialise_replacement() sets every RRPV to
-         * IRRIP_MAX_RRPV, so an untouched way already reads as "evict me" and
-         * gets filled before any resident line is disturbed. */
         for (int i = 0; i < L2C_WAY; i++)
             if (l2_irrip_rrpv[set][i] == IRRIP_MAX_RRPV)
                 return i;
 
-        /* Nobody is due yet.  Age the whole set by one and look again.
-         *
-         * This is also why insertion-based protection cannot starve data: the
-         * aging pass moves instruction lines towards the edge as well, so a
-         * protected line is given a longer deadline, never an exemption. */
         for (int i = 0; i < L2C_WAY; i++)
             l2_irrip_rrpv[set][i]++;
         irrip_age_rounds++;
     }
-
-    /* unreachable: the loop above can only exit by returning a way */
     assert(0);
     return 0;
 }
 
-
-/*----------------------------------------------------------------------------
- *  INSERTION and PROMOTION
+/* Called for both insertion (hit == 0, a line is being filled) and promotion
+ * (hit == 1, a resident line was referenced).
  *
- *  ChampSim calls this for both, and the `hit` argument says which:
- *      hit == 0  -> a line is being filled   -> INSERTION
- *      hit == 1  -> a resident line was hit  -> PROMOTION
- *
- *  `isInstruction` is the parameter Task 2a required us to add.  It is needed
- *  precisely on the insertion path: src/cache.cc runs find_victim, then this
- *  function, and only *then* fill_cache(), so at the moment of insertion
- *  block[set][way] still describes the line being thrown out, not the one
- *  arriving.  The type of the incoming line is genuinely unavailable without
- *  passing it in -- which is exactly what the handout means by "I-RRIP won't
- *  build until you finish this step".
- *--------------------------------------------------------------------------*/
+ * isInstruction is the parameter Task 2a had to add, and insertion is why: in
+ * handle_fill the order is find_victim (cache.cc:56) -> this function (527) ->
+ * fill_cache (553), and fill_cache is what writes block[set][way].instruction.
+ * So at insertion the block array still describes the line being EVICTED. The
+ * incoming line's class can only arrive as an argument -- which is exactly
+ * what "I-RRIP won't build until you finish this step" means. */
 void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
 {
-    /* Sanity check inherited from the shipped policies: a writeback is a dirty
-     * line being pushed down a level, so it carries no instruction pointer. */
-    if ((type == WRITEBACK) && ip)
+    if ((type == WRITEBACK) && ip)   /* a writeback carries no IP */
         assert(0);
 
     int cls = irrip_class(type, isInstruction);
 
     if (hit)
     {
-        /* PROMOTION -- type-aware, against my own prior argument.
-         *
-         * Instruction hits reset to 0 (SRRIP's behaviour).  Data hits go to
-         * IRRIP_PROMOTE_DATA, which at MAX_RRPV == 1 is 1: still evict-next.
-         *
-         * I argued the opposite before measuring, and the argument was decent:
-         * insertion is a guess about a line with no history, promotion is a
-         * response to evidence, and weakening promotion lets a static type
-         * prior overrule a measurement.  The sweep refuted it on every metric.
-         * The flaw was treating "was hit once in the L2" as evidence of being
-         * hot; at a 28-49% L2 load hit rate it is better read as evidence of
-         * being referenced twice, which does not justify the top of the set
-         * when an instruction line is competing for the same way.
-         *
-         * The hit is still honoured -- the line survives this eviction rather
-         * than being the victim -- it simply is not promised more than that.
-         * See IRRIP_PROMOTE_DATA above and §14 of the design document. */
-        if (type == WRITEBACK && !IRRIP_WB_PROMOTES)
-        {
-            irrip_wb_skipped++;
-            return;
-        }
-
+        if (type == WRITEBACK && !IRRIP_WB_PROMOTES) { irrip_wb_skipped++; return; }
         l2_irrip_rrpv[set][way] = irrip_promote_rrpv(cls);
         irrip_promote[cls]++;
     }
     else
     {
-        /* INSERTION -- the primary mechanism.
-         *
-         * The incoming line has no history, so the only thing the policy knows
-         * about it is its class, and the class is free: it is already riding
-         * along in the packet.  Spending that one bit here buys instruction
-         * lines (IRRIP_MAX_RRPV - IRRIP_INSERT_INSTR) aging rounds in which to
-         * show reuse, versus (IRRIP_MAX_RRPV - IRRIP_INSERT_DATA) for data.
-         * That is SHiP's idea (MICRO'11 -- pick the insertion RRPV from a
-         * signature) with a one-bit signature needing no table and no training.
-         *
-         * In the shipped configuration those budgets are 1 round and 0 rounds:
-         * an instruction line survives one aging pass, a data line is eligible
-         * for eviction immediately.
-         *
-         * I first proposed leaving data at SRRIP's max-1, so that the gain came
-         * from *protecting instructions* rather than *demoting data* -- the
-         * more attributable claim.  The sweep showed it was simply weaker, and
-         * showed why: instruction misses are ~62% of the baseline L2 load miss
-         * stream, and the exchange rate is ~0.5 data misses per instruction
-         * miss saved, so trading is profitable far beyond where I stopped.
-         * The cost is real and is reported: trace1, whose instruction stream
-         * has poor L2 reuse (0.40 instruction hits per instruction fill against
-         * trace2's 1.39), pays for a benefit it barely collects.  That is the
-         * workload-dependence Task 2b exists to resolve. */
         l2_irrip_rrpv[set][way] = irrip_insert_rrpv(cls);
         irrip_insert[cls]++;
     }
 }
 
-
-/*----------------------------------------------------------------------------
- *  FINAL STATS
- *
- *  Prints the per-class behaviour that main.cc does not report, plus the
- *  bit-level storage accounting for the configuration actually compiled, so the
- *  storage deliverable is read off the run rather than recomputed by hand.
- *--------------------------------------------------------------------------*/
 void CACHE::l2c_replacement_final_stats()
 {
-    /* Bits per RRPV: the smallest field that can hold 0..IRRIP_MAX_RRPV. */
+    /* Smallest field holding 0..IRRIP_MAX_RRPV, computed rather than hard-coded
+     * so the storage deliverable is right for whatever the sweep compiled. */
     int rrpv_bits = 1;
     while ((1 << rrpv_bits) - 1 < IRRIP_MAX_RRPV) rrpv_bits++;
 
     long rrpv_total = (long)L2C_SET * L2C_WAY * rrpv_bits;
-    /* The type bit is only a cost if the policy reads it, i.e. if the eviction
-     * preference is switched on.  Insertion and promotion get the class from
-     * the packet, which is in flight anyway and costs the cache nothing. */
-    long type_total = IRRIP_EVICT_PREFER_DATA ? (long)L2C_SET * L2C_WAY * 1 : 0;
+    /* The type bit is charged only when the policy READS it, i.e. when the
+     * eviction preference is on. Insertion and promotion take the class from
+     * the packet, which is in flight anyway and is not state the cache keeps --
+     * so instruction-consciousness itself costs 0 bits. */
+    long type_total = IRRIP_EVICT_PREFER_DATA ? (long)L2C_SET * L2C_WAY : 0;
 
     cout << NAME << " IRRIP INSERTS instr " << irrip_insert[IRRIP_INSTR]
          << " data " << irrip_insert[IRRIP_DATA]

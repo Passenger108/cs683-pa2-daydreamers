@@ -84,7 +84,7 @@ means "referenced twice", not "hot", so it does not earn the top of the set when
 an instruction line wants the same way.
 
 §14 of the design-decisions document has the measurements and the three
-predictions they refuted. Everything else in the 521-line file is knobs,
+predictions they refuted. Everything else in the 252-line file is knobs,
 classification, comments and statistics.
 
 ---

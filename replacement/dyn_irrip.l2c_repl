@@ -1,0 +1,466 @@
+#include "cache.h"
+
+/*  DYNAMIC I-RRIP -- set-duelling instruction-conscious L2       PA2 Task 2b
+ *
+ *  Task 2a's static I-RRIP wins on aggregate (instruction MPKI -38.4 %,
+ *  geomean speedup 1.0138) but not everywhere:
+ *
+ *      trace1   misses +8.7 %   IPC -0.33 %   prioritising HURTS
+ *      trace2   misses -23.0 %  IPC +3.84 %   prioritising wins big
+ *      trace3   misses  +0.8 %  IPC +0.68 %   more misses, better IPC (!)
+ *
+ *  So this policy decides at run time whether to prioritise, by sampling a few
+ *  leader sets, and switches the other sets to match.  Two modes:
+ *
+ *                     insert instr  insert data  promote instr  promote data
+ *      MODE_RRIP          max-1        max-1           0             0
+ *      MODE_IRRIP           0           max            0            max
+ *
+ *  MODE_RRIP is exactly rrip.l2c_repl, so "stop prioritising" really means
+ *  "become the supplied SRRIP".  MODE_IRRIP is Task 2a's shape rescaled.
+ *  Eviction is identical in both -- the victim scan stays a pure function of
+ *  the RRPV, so a mode flip changes two numbers and nothing else, which is the
+ *  only reason a duel between the two is tractable to reason about.
+ *
+ *  Three things in this file are decisions rather than mechanics, and
+ *  docs/TASK2B_DESIGN_DECISIONS.md argues each one properly:
+ *
+ *   1. WHY NOT THE PDF'S FORMULA AS THE DEFAULT.  The hint suggests
+ *      (instr_acc + instr_miss)/(tot_acc + tot_miss) against ~0.25.  That is
+ *      instruction VOLUME.  Measured instruction share of L2 load misses is
+ *      58.4 / 68.9 / 28.4 % -- all three clear 0.25, so it says "prioritise"
+ *      everywhere including trace1, and it is not even monotone in the right
+ *      answer (trace3 has the LOWEST share and prioritising helps it).  It is
+ *      implemented as DYN_SELECTOR 0 and swept, because the deliverable asks
+ *      for that sensitivity study and a failed selector honestly reported is
+ *      worth more than a quietly substituted one.
+ *
+ *   2. WHAT TO USE INSTEAD.  Task 2a found the predictor: instruction REUSE,
+ *      not volume.  Instruction hit rate in the L2 was 35.0 / 52.8 / 75.4 %,
+ *      perfectly ordered against IPC gains of -0.33 / +0.68 / +3.84 %.  And it
+ *      needs no new state: the PDF already requires instruction accesses and
+ *      misses in the leader sets, and hits = acc - miss.  Same two counters,
+ *      better ratio.  That is DYN_SELECTOR 1, the default.
+ *
+ *   3. WHY THE LEADERS RUN *RRIP*.  The PDF specifies this and it is
+ *      load-bearing: sampling the instruction hit rate inside sets that
+ *      already prioritise instructions would measure the policy's own effect,
+ *      and prioritising raises that rate, which argues for prioritising
+ *      harder -- a feedback loop that latches on and never re-examines itself.
+ *      Unbiased leaders make the signal describe the WORKLOAD.  (Selector 2
+ *      duels two policies on purpose, so it runs a leader group for each.)
+ *
+ *  And one trap: this file CANNOT inherit Task 2a's MAX_RRPV of 1.  RRIP mode
+ *  inserts at max-1, which at max==1 is 0 -- the instruction value -- so both
+ *  modes would become "insert everything at MRU" and the duel would compare a
+ *  policy with itself.  A dynamic policy needs dynamic range.  The general
+ *  lesson: the best static configuration is not automatically the best
+ *  substrate for a dynamic one.
+ */
+
+/* ------------------------------- knobs ---------------------------------- */
+
+/* 3 (2-bit RRPV) minimum, for the dynamic-range reason above. Swept 3 and 7. */
+#ifndef DYN_MAX_RRPV
+#define DYN_MAX_RRPV 3
+#endif
+
+/* 0 = the PDF's intensity formula, 1 = instruction hit rate, 2 = true DIP
+ * set-duelling on misses, which needs no threshold.
+ *
+ * SHIPPED AT 2, and the sweep is why. Of 15 variants, selector 2 with
+ * DYN_INSTR_WEIGHT 2 was the ONLY one that chose the better mode on all three
+ * traces (21 / 90 / 73 % prioritising, against a ground truth of
+ * RRIP / I-RRIP / I-RRIP). Every threshold variant got exactly two of three.
+ *
+ * Why, and this is the part worth understanding: selectors 0 and 1 infer the
+ * answer from a workload statistic measured in one mode. Selector 2 measures
+ * the two modes against each other. I had calibrated selector 1's threshold on
+ * instruction hit rates taken from the static I-RRIP runs (35 / 53 / 75 %) --
+ * but the leader sets run RRIP, where the same quantity reads 36 / ~45 / 18 %,
+ * and in THAT population the ordering inverts: trace3 reads lower than trace1
+ * while prioritising helps trace3 and hurts trace1. So no threshold on the
+ * unbiased hit rate can separate them. The predictive quantity turned out to
+ * be how much protection MOVES the hit rate, not its level -- and a
+ * single-mode sampler cannot see that by construction, because it only ever
+ * observes one mode. A duel can. */
+#ifndef DYN_SELECTOR
+#define DYN_SELECTOR 2
+#endif
+#define DYN_SEL_PDF   0
+#define DYN_SEL_HIT   1
+#define DYN_SEL_PSEL  2
+
+/* Threshold for selectors 0 and 1, as an integer PERCENT so no floating point
+ * enters the replacement logic. The PDF suggests 25 for its formula; for hit
+ * rate the useful boundary sits between trace1 (35) and trace3 (53). */
+#ifndef DYN_THRESH_PCT
+#define DYN_THRESH_PCT 45
+#endif
+
+/* Dead band around the threshold, in percentage points. Without it the mode
+ * flips every window whenever the metric sits near the threshold -- thrashing,
+ * not adapting. The DYN MODE stats line counts switches so this is checkable. */
+#ifndef DYN_HYST_PCT
+#define DYN_HYST_PCT 3
+#endif
+
+/* Leader sets PER GROUP out of L2C_SET. This is the deliverable's "rationale
+ * behind your number of leader sets", and it cuts both ways: more leaders give
+ * a less noisy signal but pin more of the cache to a policy that may be the
+ * wrong one. Leaders are SACRIFICED to measurement and their misses count in
+ * the reported MPKI like any others. DIP used 32 of 1024. Swept 8..128. */
+#ifndef DYN_NUM_LEADERS
+#define DYN_NUM_LEADERS 8
+#endif
+
+/* Re-decide every DYN_WINDOW qualifying accesses. Without a window the ratio
+ * is cumulative, converges early and then cannot move -- "static, chosen
+ * late" rather than dynamic. Task 1's throttle taught the same lesson: a
+ * smaller window beat a steadier estimate. */
+#ifndef DYN_WINDOW
+#define DYN_WINDOW 8192
+#endif
+
+/* Selector 2 only: how many times an instruction miss counts in the duel.
+ * 1 is DIP's plain miss duel. Above 1 encodes Task 2a 14.4 -- an instruction
+ * miss stalls the frontend with nothing to overlap, a data miss is hidden by
+ * memory-level parallelism, so they are not worth the same IPC. trace3 is the
+ * proof: prioritising gives it MORE misses and BETTER IPC, so an unweighted
+ * duel would switch away from the policy that was winning. Task 2a could not
+ * identify the true ratio (its regression was ill-conditioned), so this is
+ * swept rather than derived.
+ *
+ * MEASURED, and this is the cleanest single result in the sweep. Going from
+ * weight 1 to weight 2 changes nothing else, and it moves trace3 from 32 % to
+ * 73 % prioritising -- from the wrong call to the right one -- lifting trace3's
+ * speedup 0.9996 -> 1.0001 and the geomean 1.0059 -> 1.0069. Task 2a could not
+ * identify the relative cost of the two miss types because its regression was
+ * collinear (14.4); here it is identified by construction, since the weight is
+ * the only thing that changed. An L2 instruction miss really does cost more
+ * IPC than a data miss. */
+#ifndef DYN_INSTR_WEIGHT
+#define DYN_INSTR_WEIGHT 2
+#endif
+
+/* Fixed, not knobs: PSEL is 10 bits (DIP's own choice); window decay halves
+ * the counters rather than clearing them, so one freak window cannot flip the
+ * mode; and only demand LOADs feed the counters, because writebacks and
+ * prefetch fills are not what the core is waiting on and the graded MPKI
+ * counts loads. */
+#define DYN_PSEL_BITS 10
+#define DYN_PSEL_MAX  ((1u << DYN_PSEL_BITS) - 1u)
+#define DYN_PSEL_MID  (1u << (DYN_PSEL_BITS - 1))
+
+static_assert(DYN_MAX_RRPV >= 3 && DYN_MAX_RRPV <= 7,
+              "DYN_MAX_RRPV must be 3..7: at 1 the two modes collapse into one policy");
+static_assert(DYN_SELECTOR >= 0 && DYN_SELECTOR <= 2, "DYN_SELECTOR is 0, 1 or 2");
+static_assert(DYN_THRESH_PCT >= 0 && DYN_THRESH_PCT <= 100 &&
+              DYN_HYST_PCT >= 0 && DYN_HYST_PCT <= 25,
+              "DYN_THRESH_PCT is 0..100 and DYN_HYST_PCT is 0..25 percentage points");
+static_assert(DYN_NUM_LEADERS >= 1 && DYN_NUM_LEADERS <= L2C_SET / 4 &&
+              (L2C_SET % DYN_NUM_LEADERS) == 0,
+              "DYN_NUM_LEADERS must divide L2C_SET and leave most of the cache as followers");
+static_assert(DYN_WINDOW >= 256, "DYN_WINDOW below 256 decides on noise");
+static_assert(DYN_INSTR_WEIGHT >= 1 && DYN_INSTR_WEIGHT <= 8, "DYN_INSTR_WEIGHT is 1..8");
+
+/* ------------------------------- state ---------------------------------- */
+
+uint8_t  dyn_rrpv[L2C_SET][L2C_WAY];   /* the only per-line state           */
+uint8_t  dyn_mode;                     /* the verdict, for FOLLOWER sets    */
+uint32_t dyn_psel;                     /* selector 2's saturating counter   */
+uint64_t dyn_acc[3], dyn_mis[3];       /* [class] windowed (halved each window) -- read by the selector      */
+uint64_t dyn_tot[3], dyn_tmis[3];      /* [class] cumulative, never decayed -- the PDF's "track accesses and
+                                        * misses to these sets"; reporting only, read by no policy logic     */
+uint64_t dyn_ctr;                      /* position within the window        */
+uint64_t dyn_windows, dyn_win_irrip, dyn_switches, dyn_age_rounds;
+uint64_t dyn_ins[3], dyn_pro[3];       /* [class] stats only                */
+
+#define DYN_MODE_RRIP  0
+#define DYN_MODE_IRRIP 1
+#define DYN_TRANSL 0
+#define DYN_INSTR  1
+#define DYN_DATA   2
+
+/* Leaders every STRIDE sets.  Spreading them is necessary but NOT sufficient,
+ * and the sweep taught me the difference the hard way.
+ *
+ * The L2C set index is address bits 6..15.  A 4 KB page covers bits 0..11, so
+ * set-index bits 0..5 are the WITHIN-PAGE 64 B slot and bits 6..9 are
+ * page-number bits.  Putting the second leader group at
+ * `set % STRIDE == STRIDE/2` therefore moves it to a different within-page
+ * offset, and code and data live in different pages with different intra-page
+ * layouts -- so that offset correlates with whether a line is instruction or
+ * data.  The two groups then sample DIFFERENT ADDRESS POPULATIONS, and the
+ * duel stops being "same workload, two policies" and becomes a comparison of
+ * two policies on two different workloads.  Measured:
+ *
+ *   leaders  stride  I slots (set%64)  R slots      speedup  modes correct
+ *     8       128     {0}               {0}  SAME    1.0068      3/3
+ *    16        64     {0}               {32} disjoint 1.0027     1/3   <-- broken
+ *    32        32     {0,32}            {16,48}      1.0069      3/3
+ *
+ * 16 is the worst case (one slot each, and different ones); 32 is partly
+ * rescued because each group averages over two slots; 8 has no confound at all
+ * because stride 128 puts BOTH groups at slot 0, differing only in page
+ * number.  That is the rule the construction should have followed from the
+ * start: **the two leader groups must differ in page-number bits, not in
+ * within-page-offset bits.**
+ *
+ * So 8 is shipped not because fewer leaders is cheaper -- though at 1.6 % of
+ * the cache sacrificed against 6.2 % it is -- but because it is the leader
+ * count at which the two groups are structurally comparable.  Generalising to
+ * other counts needs a different predicate (fix the low 6 bits, vary the high
+ * 4); that is noted in docs/TASK2B_DESIGN_DECISIONS.md as the one-line change
+ * it would take, and is not shipped because it was not measured. */
+#define DYN_STRIDE (L2C_SET / DYN_NUM_LEADERS)
+#define DYN_FOLLOWER 0
+#define DYN_LEAD_RRIP 1
+#define DYN_LEAD_IRRIP 2
+
+static inline int dyn_role(uint32_t set)
+{
+#if DYN_SELECTOR == DYN_SEL_PSEL
+    /* A duel needs one leader group per policy, interleaved half a stride
+     * apart to keep both uniform -- which is why selector 2 sacrifices twice
+     * as much cache as selectors 0 and 1. */
+    uint32_t r = set % DYN_STRIDE;
+    if (r == 0)              return DYN_LEAD_IRRIP;
+    if (r == DYN_STRIDE / 2) return DYN_LEAD_RRIP;
+    return DYN_FOLLOWER;
+#else
+    return ((set % DYN_STRIDE) == 0) ? DYN_LEAD_RRIP : DYN_FOLLOWER;
+#endif
+}
+
+static inline int dyn_mode_of(uint32_t set)
+{
+    int r = dyn_role(set);
+    if (r == DYN_LEAD_RRIP)  return DYN_MODE_RRIP;    /* pinned            */
+    if (r == DYN_LEAD_IRRIP) return DYN_MODE_IRRIP;   /* pinned            */
+    return dyn_mode;                                  /* follows the duel  */
+}
+
+/* Translations first: an instruction page walk arrives with
+ * packet.instruction == 1 but holds page-table data, not instructions. Same
+ * three classes as fill_packet_type in src/cache.cc:60, so they line up with
+ * the simulator's own "<X> Evicting <Y>" counters. */
+static inline int dyn_class(uint32_t type, uint8_t isInstruction)
+{
+    if (type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION || type == TRANSLATION_FROM_L1D)
+        return DYN_TRANSL;
+    if ((type == LOAD || type == PREFETCH) && isInstruction)
+        return DYN_INSTR;
+    return DYN_DATA;
+}
+
+static inline uint8_t dyn_insert_rrpv(int mode, int cls)
+{
+    if (mode == DYN_MODE_RRIP) return DYN_MAX_RRPV - 1;
+    return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
+}
+
+static inline uint8_t dyn_promote_rrpv(int mode, int cls)
+{
+    if (mode == DYN_MODE_RRIP) return 0;
+    return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
+}
+
+/* Threshold with asymmetric hysteresis: once prioritising, it only stops below
+ * T-H; while stopped, it only starts above T+H. Integer arithmetic throughout. */
+static inline int dyn_threshold_mode(uint64_t num, uint64_t den, int cur)
+{
+    if (den == 0) return cur;                /* no evidence: do not move */
+    int bar = (cur == DYN_MODE_IRRIP) ? (DYN_THRESH_PCT - DYN_HYST_PCT)
+                                      : (DYN_THRESH_PCT + DYN_HYST_PCT);
+    if (bar < 0) bar = 0; else if (bar > 100) bar = 100;
+    return (num * 100ULL > (uint64_t)bar * den) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
+}
+
+static void dyn_end_of_window(void)
+{
+    int next = dyn_mode;
+    dyn_windows++;
+
+#if DYN_SELECTOR == DYN_SEL_PDF
+    /* The hint, implemented literally. Note it counts misses twice -- once
+     * inside "accesses" and once alone -- so it is a miss-weighted instruction
+     * share. Faithful to the text, and the oddity is worth seeing. */
+    {
+        uint64_t ia = dyn_acc[DYN_INSTR], im = dyn_mis[DYN_INSTR];
+        uint64_t ta = ia + dyn_acc[DYN_DATA] + dyn_acc[DYN_TRANSL];
+        uint64_t tm = im + dyn_mis[DYN_DATA] + dyn_mis[DYN_TRANSL];
+        next = dyn_threshold_mode(ia + im, ta + tm, dyn_mode);
+    }
+#elif DYN_SELECTOR == DYN_SEL_HIT
+    /* Instruction hit rate = (acc - miss)/acc. High means the instruction
+     * working set is being reused inside the cache, so holding it longer turns
+     * into hits; low means instruction lines stream through and protecting
+     * them only displaces data that would have been reused instead. */
+    next = dyn_threshold_mode(dyn_acc[DYN_INSTR] - dyn_mis[DYN_INSTR],
+                              dyn_acc[DYN_INSTR], dyn_mode);
+#else
+    next = (dyn_psel < DYN_PSEL_MID) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
+#endif
+
+    if (next != dyn_mode) dyn_switches++;
+    dyn_mode = next;
+    if (dyn_mode == DYN_MODE_IRRIP) dyn_win_irrip++;
+
+    /* Halve rather than clear: keeps a decaying memory of earlier windows so a
+     * single freak window cannot flip the mode, and pulls PSEL back toward the
+     * midpoint so a phase that has ended stops voting. */
+    for (int c = 0; c < 3; c++) { dyn_acc[c] >>= 1; dyn_mis[c] >>= 1; }
+    dyn_psel = (uint32_t)((int)DYN_PSEL_MID + ((int)dyn_psel - (int)DYN_PSEL_MID) / 2);
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            dyn_rrpv[i][j] = DYN_MAX_RRPV;
+
+    /* Start NEUTRAL, in RRIP mode. Starting in I-RRIP would bias the first
+     * window on every workload, and where prioritising is wrong that is damage
+     * done before any evidence exists. */
+    dyn_mode = DYN_MODE_RRIP;
+    dyn_psel = DYN_PSEL_MID;
+    for (int c = 0; c < 3; c++) { dyn_acc[c] = 0; dyn_mis[c] = 0; dyn_tot[c] = 0; dyn_tmis[c] = 0; }
+    dyn_ctr = dyn_windows = dyn_win_irrip = dyn_switches = dyn_age_rounds = 0;
+    for (int c = 0; c < 3; c++) { dyn_ins[c] = 0; dyn_pro[c] = 0; }
+
+    cout << NAME << " DYN-IRRIP config"
+         << "  MAX_RRPV " << DYN_MAX_RRPV
+         << " | SELECTOR " << DYN_SELECTOR
+         << " thresh " << DYN_THRESH_PCT
+         << " hyst " << DYN_HYST_PCT
+         << " | LEADERS " << DYN_NUM_LEADERS
+         << " stride " << DYN_STRIDE
+         << " | WINDOW " << DYN_WINDOW
+         << " | INSTR_WEIGHT " << DYN_INSTR_WEIGHT
+         << endl;
+}
+
+/* Victim selection: plain RRIP, identical in both modes. */
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1)
+    {
+        for (int i = 0; i < L2C_WAY; i++)
+            if (dyn_rrpv[set][i] == DYN_MAX_RRPV)
+                return i;
+        for (int i = 0; i < L2C_WAY; i++)
+            dyn_rrpv[set][i]++;
+        dyn_age_rounds++;
+    }
+    assert(0);
+    return 0;
+}
+
+/* Insertion (hit == 0) and promotion (hit == 1), plus the leader-set
+ * measurement that drives the duel.
+ *
+ * That `hit` flag is what makes the accounting possible from this one hook:
+ * every qualifying call is one access, and !hit marks it as a miss. No extra
+ * instrumentation in cache.cc is needed -- and `isInstruction`, the parameter
+ * Task 2a added, is what separates instruction from data traffic, which is
+ * exactly what the PDF asks the leader sets to track. */
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    int cls  = dyn_class(type, isInstruction);
+    int role = dyn_role(set);
+    int mode = dyn_mode_of(set);
+
+    if (type == LOAD)          /* demand loads only -- see the knob block */
+    {
+        /* ---- the PDF's required tracking, ALWAYS ON --------------------
+         * "Track the number of instruction and non-instruction line accesses
+         * and misses to these [leader] sets."  That is a requirement, not an
+         * implementation detail of one selector, so it runs for every value of
+         * DYN_SELECTOR.  It used to sit in the #else below, which meant
+         * shipping the duel silently switched off the tracking the assignment
+         * asks for -- the stats line printed zeros and nothing complained.
+         *
+         * Indexed by class so translations keep their own bucket instead of
+         * being folded into data: the same three-way split Task 2a used, which
+         * is what lets these counters be read against the simulator's own
+         * per-class eviction counters.
+         *
+         * Sampled in the RRIP leader group only, because an unbiased estimate
+         * is the whole point (see the header): inside I-RRIP sets the policy
+         * would be measuring its own effect.  Selectors 0 and 1 consult these
+         * counters to decide; selector 2 does not, so for the shipped
+         * configuration they are pure reporting and change no behaviour. */
+        if (role == DYN_LEAD_RRIP)
+        {
+            dyn_acc[cls]++;              /* windowed, decays -- drives the duel */
+            if (!hit) dyn_mis[cls]++;
+            dyn_tot[cls]++;             /* cumulative, for the final-stats line */
+            if (!hit) dyn_tmis[cls]++;
+        }
+
+#if DYN_SELECTOR == DYN_SEL_PSEL
+        /* Each leader group's misses argue against its own policy, so a low
+         * PSEL means I-RRIP is winning. Followers do not vote: they are the
+         * thing being decided for. */
+        if (!hit)
+        {
+            int w = (cls == DYN_INSTR) ? DYN_INSTR_WEIGHT : 1;
+            int d = (role == DYN_LEAD_IRRIP) ? +w : (role == DYN_LEAD_RRIP ? -w : 0);
+            int v = (int)dyn_psel + d;
+            dyn_psel = (uint32_t)(v < 0 ? 0 : (v > (int)DYN_PSEL_MAX ? (int)DYN_PSEL_MAX : v));
+        }
+#endif
+        if (++dyn_ctr >= DYN_WINDOW) { dyn_end_of_window(); dyn_ctr = 0; }
+    }
+
+    if (hit) { dyn_rrpv[set][way] = dyn_promote_rrpv(mode, cls); dyn_pro[cls]++; }
+    else     { dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls); dyn_ins[cls]++; }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    int rrpv_bits = 1;
+    while ((1 << rrpv_bits) - 1 < DYN_MAX_RRPV) rrpv_bits++;
+    long rrpv_total = (long)L2C_SET * L2C_WAY * rrpv_bits;
+
+    /* Everything the duel costs beyond the RRPVs: four windowed counters sized
+     * to the window (not the run -- that is the point of windowing), the window
+     * position, PSEL, and one bit of mode. */
+    int cb = 1;
+    while ((1L << cb) < (long)DYN_WINDOW) cb++;
+    long sel_total = 5L * cb + DYN_PSEL_BITS + 1;
+
+    cout << NAME << " DYN MODE windows " << dyn_windows
+         << " in_irrip " << dyn_win_irrip
+         << " pct_irrip " << (dyn_windows ? (100.0 * dyn_win_irrip / dyn_windows) : 0.0)
+         << " switches " << dyn_switches << endl;
+    cout << NAME << " DYN PSEL final " << dyn_psel << " mid " << DYN_PSEL_MID << endl;
+    /* Cumulative leader-set traffic: the PDF asks for the count of instruction
+     * vs non-instruction accesses and misses to the dueling sets.  The windowed
+     * dyn_acc/dyn_mis above are halved every window so the selector forgets old
+     * phases -- useless as a reported total -- so we report dyn_tot/dyn_tmis,
+     * which only ever increment.  Changing this line changes no behaviour. */
+    cout << NAME << " DYN COUNTERS instr_acc " << dyn_tot[DYN_INSTR]
+         << " instr_miss " << dyn_tmis[DYN_INSTR]
+         << " data_acc " << dyn_tot[DYN_DATA]
+         << " data_miss " << dyn_tmis[DYN_DATA]
+         << " transl_acc " << dyn_tot[DYN_TRANSL]
+         << " transl_miss " << dyn_tmis[DYN_TRANSL] << endl;
+    cout << NAME << " DYN INSERTS instr " << dyn_ins[DYN_INSTR]
+         << " data " << dyn_ins[DYN_DATA] << " transl " << dyn_ins[DYN_TRANSL] << endl;
+    cout << NAME << " DYN PROMOTES instr " << dyn_pro[DYN_INSTR]
+         << " data " << dyn_pro[DYN_DATA] << " transl " << dyn_pro[DYN_TRANSL] << endl;
+    cout << NAME << " DYN LEADERS per_group " << DYN_NUM_LEADERS << " of " << L2C_SET
+         << " sacrificed_pct "
+         << (100.0 * DYN_NUM_LEADERS * ((DYN_SELECTOR == DYN_SEL_PSEL) ? 2 : 1) / L2C_SET) << endl;
+    cout << NAME << " DYN AGE ROUNDS " << dyn_age_rounds << endl;
+    cout << NAME << " DYN STORAGE rrpv_bits_per_line " << rrpv_bits
+         << " rrpv_bits " << rrpv_total
+         << " selector_bits " << sel_total
+         << " total_bits " << (rrpv_total + sel_total)
+         << " total_bytes " << ((rrpv_total + sel_total + 7) / 8) << endl;
+}

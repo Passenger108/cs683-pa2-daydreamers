@@ -120,9 +120,14 @@ for f in files:
 check('all %d update_replacement_state definitions have 9 params' % len(sigs),
       all(k == 9 for _, k in sigs),
       str([s for s in sigs if s[1] != 9]))
-check('design doc claims 27 EDITED declarations and 29 total in tree',
-      len(sigs) == 29 and '27 declarations' in DD and '**27**' in DD and '29 nine-parameter' in DD,
-      'counted %d definitions across %d files' % (len(sigs), len(files)))
+# 27 EDITED is the stable claim; the tree total grows with every policy file
+# added (rrip shipped correct, irrip is Task 2a, dyn_irrip is Task 2b), so
+# asserting it would go stale on every new task.  The invariant that matters
+# is checked just above: every definition found has 9 parameters.
+check('design doc claims 27 EDITED declarations',
+      '27 declarations' in DD and '**27**' in DD)
+check('%d nine-param definitions now in tree (grows as policies are added)' % len(sigs),
+      len(sigs) >= 29, 'counted %d across %d files' % (len(sigs), len(files)))
 # TREE-WIDE, keyed on the callee rather than on one calling idiom.  The first
 # version of this check grepped `this->*update_replacement_state` in cache.cc
 # alone, found 6, and was blind to the three BTB sites in src/ooo_cpu.cc that

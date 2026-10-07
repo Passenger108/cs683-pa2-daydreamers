@@ -158,9 +158,24 @@ VARIANTS = [
 
 # --------------------------------------------------------------------------
 def write_variant(knobs):
-    """Copy the policy, rewriting the requested #define lines."""
+    """Copy the policy, pinning EVERY knob to CENTRE plus this variant's overrides.
+
+    It used to rewrite only the overrides and let the rest inherit whatever the
+    shipped source happened to say.  That silently broke the moment Task 2a's
+    chosen configuration changed the default MAX_RRPV from 3 to 1: ten variants
+    were defined against a MAX_RRPV=3 centre without restating it, so they
+    inherited 1 and then failed their own static_asserts (INSERT_INSTR=2 with a
+    maximum of 1, EVICT_SLACK=2 with a maximum of 1, and so on).  The sweep had
+    stopped being reproducible from the current source, which is exactly the
+    kind of silent rot the identity check downstream exists to catch.
+
+    Pinning all ten makes each variant a complete, self-contained
+    specification, independent of whatever the shipped default is today.
+    """
+    full = dict(CENTRE)
+    full.update(knobs)
     t = io.open(SRC, encoding='utf-8').read()
-    for k, v in knobs.items():
+    for k, v in full.items():
         pat = re.compile(r'^#define IRRIP_%s .*$' % re.escape(k), re.M)
         if not pat.search(t):
             raise SystemExit('knob IRRIP_%s not found in %s' % (k, SRC))

@@ -190,9 +190,11 @@ ever built with `lru` as the L2C policy, so `rrip.l2c_repl` was never compiled.
 | the 8 generated `replacement/*_replacement.cc` files | 8 — overwritten from the `.*_repl` sources on every build, so editing them is strictly unnecessary; I did it anyway so that a bare `make` on a fresh checkout also compiles, instead of only working after a `build_champsim.sh`. |
 | **total edited** | **27** |
 
-Two files were already correct and were not touched: `replacement/rrip.l2c_repl`
-(shipped at 9 parameters — §4.1) and `replacement/irrip.l2c_repl` (new). So the
-tree now holds 29 nine-parameter definitions in total.
+Two files needed no edit: `replacement/rrip.l2c_repl`, which shipped at 9
+parameters (§4.1), and `replacement/irrip.l2c_repl`, which is new. Every policy
+added later — `dyn_irrip.l2c_repl` for Task 2b — is written against the
+9-parameter signature from the start, so the tree total grows with the
+assignment while the 27 edits stay fixed.
 
 The anchor used for the edit was the exact string `uint32_t type, uint8_t hit)`.
 That is safe because `find_victim` ends `uint32_t type)` with no `hit`, and the
