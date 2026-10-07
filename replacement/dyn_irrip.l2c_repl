@@ -143,6 +143,47 @@
 #define DYN_INSTR_WEIGHT 2
 #endif
 
+/* ---- Task 3: SPP awareness -------------------------------------------------
+ * The PDF's Task 3 says: "modify your dynamic I-RRIP policy to incorporate
+ * awareness of lines brought in by SPP (hint: check packet type as PREFETCH or
+ * not)".  A fill with type == PREFETCH is a PREDICTION the prefetcher made, not
+ * a line the core demanded.  Our own Task 1 measurements say those predictions
+ * are right only 48-57 % of the time (task1.csv l1d_accuracy), so ~half of them
+ * are speculative junk.  Standalone SPP runs with LRU at L2, which inserts every
+ * prefetch at MRU -- maximally protected -- so that junk half sits in the cache
+ * and evicts demand lines.  THAT pollution is the headroom this knob exploits.
+ *
+ * DYN_SPP_AWARE 0 is the honest ablation: a prefetch is treated as ordinary
+ * data (whatever the mode would do with a data line).  This is "dynamic I-RRIP
+ * that ignores prefetch origin", and the sweep runs it so we can PROVE that
+ * awareness -- not merely adding SPP -- is what moves IPC.
+ *
+ * When aware, a prefetch is inserted at DYN_PF_INSERT regardless of mode (a
+ * speculative line is speculative whether or not we are prioritising
+ * instructions this window).  A demand hit on a still-unused prefetched line
+ * (block.prefetch == 1, read before cache.cc clears it at line 1849) is an
+ * ACCURATE prefetch; it then promotes exactly like a demand line -- protection
+ * is earned by proven use, never granted on speculation.  This is the PACMan
+ * (Wu et al., MICRO'11) insight applied to our duel.
+ *
+ * Inert without a prefetcher: Task 2b builds with `no` L1D prefetcher, so no
+ * PREFETCH fill ever reaches L2 and none of this code runs -- the Task 2b logs
+ * stay bit-identical (re-verified).  This is why the PDF can ask us to edit the
+ * SAME file: the awareness only activates in the `spp dyn_irrip` build. */
+#ifndef DYN_SPP_AWARE
+#define DYN_SPP_AWARE 1
+#endif
+
+/* RRPV at which an aware prefetch is inserted.  NOT guessed -- swept.  The
+ * tension: accuracy ~50 % means MAX_RRPV (evict-next) throws away the useful
+ * half before its demand hit and could LOSE to SPP+LRU, while 0 (full
+ * protection) just reproduces LRU's pollution.  sweep_task3.py sweeps
+ * {unaware, MAX_RRPV-1, MAX_RRPV} and the shipped value is set from the logs.
+ * Starting point MAX_RRPV; revisited in docs/TASK3_DESIGN_DECISIONS.md. */
+#ifndef DYN_PF_INSERT
+#define DYN_PF_INSERT DYN_MAX_RRPV
+#endif
+
 /* Fixed, not knobs: PSEL is 10 bits (DIP's own choice); window decay halves
  * the counters rather than clearing them, so one freak window cannot flip the
  * mode; and only demand LOADs feed the counters, because writebacks and
@@ -163,6 +204,9 @@ static_assert(DYN_NUM_LEADERS >= 1 && DYN_NUM_LEADERS <= L2C_SET / 4 &&
               "DYN_NUM_LEADERS must divide L2C_SET and leave most of the cache as followers");
 static_assert(DYN_WINDOW >= 256, "DYN_WINDOW below 256 decides on noise");
 static_assert(DYN_INSTR_WEIGHT >= 1 && DYN_INSTR_WEIGHT <= 8, "DYN_INSTR_WEIGHT is 1..8");
+static_assert(DYN_SPP_AWARE == 0 || DYN_SPP_AWARE == 1, "DYN_SPP_AWARE is 0 or 1");
+static_assert(DYN_PF_INSERT >= 0 && DYN_PF_INSERT <= DYN_MAX_RRPV,
+              "DYN_PF_INSERT is an RRPV, 0..DYN_MAX_RRPV");
 
 /* ------------------------------- state ---------------------------------- */
 
@@ -175,6 +219,7 @@ uint64_t dyn_tot[3], dyn_tmis[3];      /* [class] cumulative, never decayed -- t
 uint64_t dyn_ctr;                      /* position within the window        */
 uint64_t dyn_windows, dyn_win_irrip, dyn_switches, dyn_age_rounds;
 uint64_t dyn_ins[3], dyn_pro[3];       /* [class] stats only                */
+uint64_t dyn_pf_ins, dyn_pf_useful;    /* Task 3: prefetch inserts, and demand hits on still-unused prefetched lines */
 
 #define DYN_MODE_RRIP  0
 #define DYN_MODE_IRRIP 1
@@ -254,8 +299,13 @@ static inline int dyn_class(uint32_t type, uint8_t isInstruction)
     return DYN_DATA;
 }
 
-static inline uint8_t dyn_insert_rrpv(int mode, int cls)
+static inline uint8_t dyn_insert_rrpv(int mode, int cls, int pf)
 {
+#if DYN_SPP_AWARE
+    if (pf) return DYN_PF_INSERT;   /* speculative line: swept insertion depth, mode-independent */
+#else
+    (void)pf;                       /* unaware ablation: a prefetch is just data */
+#endif
     if (mode == DYN_MODE_RRIP) return DYN_MAX_RRPV - 1;
     return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
 }
@@ -328,6 +378,7 @@ void CACHE::l2c_initialize_replacement()
     for (int c = 0; c < 3; c++) { dyn_acc[c] = 0; dyn_mis[c] = 0; dyn_tot[c] = 0; dyn_tmis[c] = 0; }
     dyn_ctr = dyn_windows = dyn_win_irrip = dyn_switches = dyn_age_rounds = 0;
     for (int c = 0; c < 3; c++) { dyn_ins[c] = 0; dyn_pro[c] = 0; }
+    dyn_pf_ins = dyn_pf_useful = 0;
 
     cout << NAME << " DYN-IRRIP config"
          << "  MAX_RRPV " << DYN_MAX_RRPV
@@ -338,6 +389,8 @@ void CACHE::l2c_initialize_replacement()
          << " stride " << DYN_STRIDE
          << " | WINDOW " << DYN_WINDOW
          << " | INSTR_WEIGHT " << DYN_INSTR_WEIGHT
+         << " | SPP_AWARE " << DYN_SPP_AWARE
+         << " PF_INSERT " << DYN_PF_INSERT
          << endl;
 }
 
@@ -373,6 +426,12 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     int cls  = dyn_class(type, isInstruction);
     int role = dyn_role(set);
     int mode = dyn_mode_of(set);
+    int pf   = (type == PREFETCH);            /* Task 3: SPP-brought line? */
+
+    /* A demand hit on a line still flagged as prefetched = an SPP prediction
+     * that just proved correct.  block.prefetch is read HERE because cache.cc
+     * clears it immediately after this call returns (src/cache.cc:1849). */
+    if (hit && type == LOAD && block[set][way].prefetch) dyn_pf_useful++;
 
     if (type == LOAD)          /* demand loads only -- see the knob block */
     {
@@ -418,7 +477,11 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     }
 
     if (hit) { dyn_rrpv[set][way] = dyn_promote_rrpv(mode, cls); dyn_pro[cls]++; }
-    else     { dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls); dyn_ins[cls]++; }
+    else {
+        dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls, pf);
+        dyn_ins[cls]++;
+        if (pf) dyn_pf_ins++;                 /* Task 3: count speculative inserts */
+    }
 }
 
 void CACHE::l2c_replacement_final_stats()
@@ -457,6 +520,12 @@ void CACHE::l2c_replacement_final_stats()
     cout << NAME << " DYN LEADERS per_group " << DYN_NUM_LEADERS << " of " << L2C_SET
          << " sacrificed_pct "
          << (100.0 * DYN_NUM_LEADERS * ((DYN_SELECTOR == DYN_SEL_PSEL) ? 2 : 1) / L2C_SET) << endl;
+    cout << NAME << " DYN PREFETCH aware " << DYN_SPP_AWARE
+         << " pf_insert_rrpv " << DYN_PF_INSERT
+         << " pf_inserts " << dyn_pf_ins
+         << " pf_useful_at_l2 " << dyn_pf_useful
+         << " pf_hit_rate " << (dyn_pf_ins ? (100.0 * dyn_pf_useful / dyn_pf_ins) : 0.0)
+         << endl;
     cout << NAME << " DYN AGE ROUNDS " << dyn_age_rounds << endl;
     cout << NAME << " DYN STORAGE rrpv_bits_per_line " << rrpv_bits
          << " rrpv_bits " << rrpv_total
