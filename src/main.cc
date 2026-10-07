@@ -1814,6 +1814,12 @@ int main(int argc, char** argv)
         ooo_cpu[i].l1i_prefetcher_final_stats();
 	ooo_cpu[i].L1D.l1d_prefetcher_final_stats();
         ooo_cpu[i].L2C.l2c_prefetcher_final_stats();
+	//PA2 Task 2a: ChampSim only calls the L2C *replacement* final-stats hook
+	//inside the `if (NUM_CPUS > 1)` block above, so on a single-core run --
+	//which is every run this assignment asks for -- it never fired and the
+	//policy's own counters were silently discarded.  Its prefetcher sibling
+	//two lines up is called from both paths; this one was simply missed.
+	ooo_cpu[i].L2C.l2c_replacement_final_stats();
 	ooo_cpu[i].DTLB.dtlb_prefetcher_final_stats();
 	ooo_cpu[i].STLB.stlb_prefetcher_final_stats();
     }
