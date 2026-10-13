@@ -1,0 +1,173 @@
+#include "cache.h"
+
+
+#ifndef IRRIP_MAX_RRPV
+#define IRRIP_MAX_RRPV 1
+#endif
+
+#ifndef IRRIP_INSERT_INSTR
+#define IRRIP_INSERT_INSTR 0
+#endif
+#ifndef IRRIP_INSERT_DATA
+#define IRRIP_INSERT_DATA IRRIP_MAX_RRPV
+#endif
+#ifndef IRRIP_INSERT_TRANSL
+#define IRRIP_INSERT_TRANSL IRRIP_MAX_RRPV
+#endif
+
+#ifndef IRRIP_PROMOTE_INSTR
+#define IRRIP_PROMOTE_INSTR 0
+#endif
+#ifndef IRRIP_PROMOTE_DATA
+#define IRRIP_PROMOTE_DATA IRRIP_MAX_RRPV
+#endif
+#ifndef IRRIP_PROMOTE_TRANSL
+#define IRRIP_PROMOTE_TRANSL 0
+#endif
+
+#ifndef IRRIP_EVICT_PREFER_DATA
+#define IRRIP_EVICT_PREFER_DATA 0
+#endif
+#ifndef IRRIP_EVICT_SLACK
+#define IRRIP_EVICT_SLACK 0
+#endif
+
+#ifndef IRRIP_WB_PROMOTES
+#define IRRIP_WB_PROMOTES 1
+#endif
+
+static_assert(IRRIP_MAX_RRPV >= 1 && IRRIP_MAX_RRPV <= 7, "IRRIP_MAX_RRPV must be 1..7");
+static_assert(IRRIP_INSERT_INSTR  >= 0 && IRRIP_INSERT_INSTR  <= IRRIP_MAX_RRPV &&
+              IRRIP_INSERT_DATA   >= 0 && IRRIP_INSERT_DATA   <= IRRIP_MAX_RRPV &&
+              IRRIP_INSERT_TRANSL >= 0 && IRRIP_INSERT_TRANSL <= IRRIP_MAX_RRPV,
+              "an IRRIP_INSERT_* value is outside 0..IRRIP_MAX_RRPV");
+static_assert(IRRIP_PROMOTE_INSTR  >= 0 && IRRIP_PROMOTE_INSTR  <= IRRIP_MAX_RRPV &&
+              IRRIP_PROMOTE_DATA   >= 0 && IRRIP_PROMOTE_DATA   <= IRRIP_MAX_RRPV &&
+              IRRIP_PROMOTE_TRANSL >= 0 && IRRIP_PROMOTE_TRANSL <= IRRIP_MAX_RRPV,
+              "an IRRIP_PROMOTE_* value is outside 0..IRRIP_MAX_RRPV");
+static_assert(IRRIP_EVICT_SLACK >= 0 && IRRIP_EVICT_SLACK < IRRIP_MAX_RRPV,
+              "IRRIP_EVICT_SLACK must be 0..IRRIP_MAX_RRPV-1");
+static_assert((IRRIP_WB_PROMOTES == 0 || IRRIP_WB_PROMOTES == 1) &&
+              (IRRIP_EVICT_PREFER_DATA == 0 || IRRIP_EVICT_PREFER_DATA == 1),
+              "IRRIP_WB_PROMOTES and IRRIP_EVICT_PREFER_DATA are 0 or 1");
+
+
+uint8_t  l2_irrip_rrpv[L2C_SET][L2C_WAY];   /* the only per-line state      */
+uint64_t irrip_insert[3], irrip_promote[3]; /* stats only; never a decision */
+uint64_t irrip_wb_skipped, irrip_evict_pref, irrip_age_rounds;
+
+#define IRRIP_TRANSL 0
+#define IRRIP_INSTR  1
+#define IRRIP_DATA   2
+
+static inline int irrip_class(uint32_t type, uint8_t is_instruction)
+{
+    if (type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION || type == TRANSLATION_FROM_L1D)
+        return IRRIP_TRANSL;
+    if ((type == LOAD || type == PREFETCH) && is_instruction)
+        return IRRIP_INSTR;
+    return IRRIP_DATA;
+}
+
+static inline uint8_t irrip_insert_rrpv(int cls)
+{
+    if (cls == IRRIP_INSTR)  return IRRIP_INSERT_INSTR;
+    if (cls == IRRIP_TRANSL) return IRRIP_INSERT_TRANSL;
+    return IRRIP_INSERT_DATA;
+}
+
+static inline uint8_t irrip_promote_rrpv(int cls)
+{
+    if (cls == IRRIP_INSTR)  return IRRIP_PROMOTE_INSTR;
+    if (cls == IRRIP_TRANSL) return IRRIP_PROMOTE_TRANSL;
+    return IRRIP_PROMOTE_DATA;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_irrip_rrpv[i][j] = IRRIP_MAX_RRPV;
+
+    for (int c = 0; c < 3; c++) { irrip_insert[c] = 0; irrip_promote[c] = 0; }
+    irrip_wb_skipped = irrip_evict_pref = irrip_age_rounds = 0;
+
+    cout << NAME << " I-RRIP config"
+         << "  MAX_RRPV " << IRRIP_MAX_RRPV
+         << " | INSERT instr " << IRRIP_INSERT_INSTR
+         << " data " << IRRIP_INSERT_DATA
+         << " transl " << IRRIP_INSERT_TRANSL
+         << " | PROMOTE instr " << IRRIP_PROMOTE_INSTR
+         << " data " << IRRIP_PROMOTE_DATA
+         << " transl " << IRRIP_PROMOTE_TRANSL
+         << " | EVICT_PREFER_DATA " << IRRIP_EVICT_PREFER_DATA
+         << " slack " << IRRIP_EVICT_SLACK
+         << " | WB_PROMOTES " << IRRIP_WB_PROMOTES
+         << endl;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1)
+    {
+#if IRRIP_EVICT_PREFER_DATA
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_irrip_rrpv[set][i] + IRRIP_EVICT_SLACK >= IRRIP_MAX_RRPV
+                && current_set[i].instruction == 0)
+            { irrip_evict_pref++; return i; }
+#endif
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_irrip_rrpv[set][i] == IRRIP_MAX_RRPV)
+                return i;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_irrip_rrpv[set][i]++;
+        irrip_age_rounds++;
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t is_instruction)
+{
+    if ((type == WRITEBACK) && ip)   /* a writeback carries no IP */
+        assert(0);
+
+    int cls = irrip_class(type, is_instruction);
+
+    if (hit)
+    {
+        if (type == WRITEBACK && !IRRIP_WB_PROMOTES) { irrip_wb_skipped++; return; }
+        l2_irrip_rrpv[set][way] = irrip_promote_rrpv(cls);
+        irrip_promote[cls]++;
+    }
+    else
+    {
+        l2_irrip_rrpv[set][way] = irrip_insert_rrpv(cls);
+        irrip_insert[cls]++;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    int rrpv_bits = 1;
+    while ((1 << rrpv_bits) - 1 < IRRIP_MAX_RRPV) rrpv_bits++;
+
+    long rrpv_total = (long)L2C_SET * L2C_WAY * rrpv_bits;
+    long type_total = IRRIP_EVICT_PREFER_DATA ? (long)L2C_SET * L2C_WAY : 0;
+
+    cout << NAME << " IRRIP INSERTS instr " << irrip_insert[IRRIP_INSTR]
+         << " data " << irrip_insert[IRRIP_DATA]
+         << " transl " << irrip_insert[IRRIP_TRANSL] << endl;
+    cout << NAME << " IRRIP PROMOTES instr " << irrip_promote[IRRIP_INSTR]
+         << " data " << irrip_promote[IRRIP_DATA]
+         << " transl " << irrip_promote[IRRIP_TRANSL] << endl;
+    cout << NAME << " IRRIP WB SKIPPED " << irrip_wb_skipped << endl;
+    cout << NAME << " IRRIP EVICT PREF FIRED " << irrip_evict_pref << endl;
+    cout << NAME << " IRRIP AGE ROUNDS " << irrip_age_rounds << endl;
+    cout << NAME << " IRRIP STORAGE rrpv_bits_per_line " << rrpv_bits
+         << " rrpv_bits " << rrpv_total
+         << " type_bits " << type_total
+         << " total_bits " << (rrpv_total + type_total)
+         << " total_bytes " << ((rrpv_total + type_total) / 8) << endl;
+}
