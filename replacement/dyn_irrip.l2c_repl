@@ -1,0 +1,66 @@
+#include "cache.h"
+
+#ifndef DYN_MAX_RRPV
+#define DYN_MAX_RRPV 3
+#endif
+
+#ifndef DYN_NUM_LEADERS
+#define DYN_NUM_LEADERS 8
+#endif
+
+#ifndef DYN_WINDOW
+#define DYN_WINDOW 8192
+#endif
+
+#define DYN_MODE_RRIP  0
+#define DYN_MODE_IRRIP 1
+
+uint8_t  dyn_rrpv[L2C_SET][L2C_WAY];
+uint8_t  dyn_mode;
+uint64_t dyn_windows, dyn_win_irrip, dyn_switches, dyn_age_rounds;
+
+void CACHE::l2c_initialize_replacement()
+{
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            dyn_rrpv[i][j] = DYN_MAX_RRPV;
+        }
+    }
+    dyn_mode = DYN_MODE_RRIP;
+    dyn_windows = dyn_win_irrip = dyn_switches = dyn_age_rounds = 0;
+
+    cout << NAME << " DYN-IRRIP initialized. MAX_RRPV: " << DYN_MAX_RRPV 
+         << " LEADERS: " << DYN_NUM_LEADERS << endl;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1) {
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (dyn_rrpv[set][i] == DYN_MAX_RRPV)
+                return i;
+        }
+        for (int i = 0; i < L2C_WAY; i++) {
+            dyn_rrpv[set][i]++;
+        }
+        dyn_age_rounds++;
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit)
+        dyn_rrpv[set][way] = 0;
+    else
+        dyn_rrpv[set][way] = DYN_MAX_RRPV - 1;
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << NAME << " DYN-IRRIP final stats" << endl;
+}
