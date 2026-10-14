@@ -1,0 +1,330 @@
+#include "cache.h"
+#include <cstdint>
+#include <iostream>
+
+uint32_t maxIRRPV = 3;
+
+constexpr uint32_t NUM_LEADER_SETS_PER_POLICY = 32;
+
+constexpr uint32_t PSEL_MAX = 15;
+constexpr uint32_t PSEL_MID = (PSEL_MAX + 1) / 2;
+
+constexpr double INSTR_TRAFFIC_THRESHOLD = 0.30;
+
+uint32_t psel = PSEL_MID;
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+uint64_t rrip_leader_accesses = 0;
+uint64_t rrip_leader_misses = 0;
+
+uint64_t irrip_leader_accesses = 0;
+uint64_t irrip_leader_misses = 0;
+
+uint64_t rrip_leader_instr_accesses = 0;
+uint64_t rrip_leader_data_accesses = 0;
+
+uint64_t irrip_leader_instr_accesses = 0;
+uint64_t irrip_leader_data_accesses = 0;
+
+uint64_t rrip_leader_instr_misses = 0;
+uint64_t rrip_leader_data_misses = 0;
+
+uint64_t irrip_leader_instr_misses = 0;
+uint64_t irrip_leader_data_misses = 0;
+
+bool use_irrip = false;
+bool psel_prefers_irrip = false;
+
+
+bool is_rrip_leader_set(uint32_t set)
+{
+    return (set % NUM_LEADER_SETS_PER_POLICY) == 0;
+}
+
+bool is_irrip_leader_set(uint32_t set)
+{
+    return (set % NUM_LEADER_SETS_PER_POLICY) == 1;
+}
+
+bool is_leader_set(uint32_t set)
+{
+    return is_rrip_leader_set(set) ||
+           is_irrip_leader_set(set);
+}
+
+
+void update_policy_selector(bool rrip_leader, bool miss)
+{
+    if (miss) {
+        if (rrip_leader) {
+            if (psel < PSEL_MAX)
+                psel++;
+        } else {
+            if (psel > 0)
+                psel--;
+        }
+    }
+
+    psel_prefers_irrip = (psel > PSEL_MID);
+}
+
+
+double get_instruction_traffic_ratio()
+{
+    uint64_t instr_accesses =
+        rrip_leader_instr_accesses +
+        irrip_leader_instr_accesses;
+
+    uint64_t total_accesses =
+        rrip_leader_accesses +
+        irrip_leader_accesses;
+
+    uint64_t instr_misses =
+        rrip_leader_instr_misses +
+        irrip_leader_instr_misses;
+
+    uint64_t total_misses =
+        rrip_leader_misses +
+        irrip_leader_misses;
+
+    uint64_t denominator = total_accesses + total_misses;
+
+    if (denominator == 0)
+        return 0.0;
+
+    return static_cast<double>(instr_accesses + instr_misses)
+           / denominator;
+}
+
+
+void update_follower_policy()
+{
+    double instr_ratio = get_instruction_traffic_ratio();
+
+    if (psel_prefers_irrip) {
+        use_irrip = true;
+    } else {
+        use_irrip =
+            (instr_ratio > INSTR_TRAFFIC_THRESHOLD);
+    }
+}
+
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize set-dueling dynamic I-RRIP for L2C"
+         << endl;
+
+    for (uint32_t set = 0; set < L2C_SET; set++) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            l2_rrpv[set][way] = maxIRRPV;
+        }
+    }
+
+    psel = PSEL_MID;
+    use_irrip = false;
+    psel_prefers_irrip = false;
+
+    rrip_leader_accesses = 0;
+    rrip_leader_misses = 0;
+
+    irrip_leader_accesses = 0;
+    irrip_leader_misses = 0;
+
+    rrip_leader_instr_accesses = 0;
+    rrip_leader_data_accesses = 0;
+
+    irrip_leader_instr_accesses = 0;
+    irrip_leader_data_accesses = 0;
+
+    rrip_leader_instr_misses = 0;
+    rrip_leader_data_misses = 0;
+
+    irrip_leader_instr_misses = 0;
+    irrip_leader_data_misses = 0;
+}
+
+
+uint32_t CACHE::l2c_find_victim(
+    uint32_t cpu,
+    uint64_t instr_id,
+    uint32_t set,
+    const BLOCK* current_set,
+    uint64_t ip,
+    uint64_t full_addr,
+    uint32_t type)
+{
+    for (uint32_t way = 0; way < L2C_WAY; way++) {
+        if (!current_set[way].valid)
+            return way;
+    }
+
+    bool prioritize_instructions;
+
+    if (is_rrip_leader_set(set)) {
+        prioritize_instructions = false;
+    } else if (is_irrip_leader_set(set)) {
+        prioritize_instructions = true;
+    } else {
+        prioritize_instructions = use_irrip;
+    }
+
+    while (true) {
+        if (prioritize_instructions) {
+            for (uint32_t way = 0; way < L2C_WAY; way++) {
+                if (l2_rrpv[set][way] == maxIRRPV &&
+                    !current_set[way].instruction) {
+                    return way;
+                }
+            }
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] == maxIRRPV)
+                return way;
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] < maxIRRPV)
+                l2_rrpv[set][way]++;
+        }
+    }
+}
+
+
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
+{
+    bool miss = (hit == 0);
+
+    if (is_rrip_leader_set(set)) {
+        rrip_leader_accesses++;
+
+        if (isInstruction)
+            rrip_leader_instr_accesses++;
+        else
+            rrip_leader_data_accesses++;
+
+        if (miss) {
+            rrip_leader_misses++;
+
+            if (isInstruction)
+                rrip_leader_instr_misses++;
+            else
+                rrip_leader_data_misses++;
+        }
+
+        update_policy_selector(true, miss);
+    }
+    else if (is_irrip_leader_set(set)) {
+        irrip_leader_accesses++;
+
+        if (isInstruction)
+            irrip_leader_instr_accesses++;
+        else
+            irrip_leader_data_accesses++;
+
+        if (miss) {
+            irrip_leader_misses++;
+
+            if (isInstruction)
+                irrip_leader_instr_misses++;
+            else
+                irrip_leader_data_misses++;
+        }
+
+        update_policy_selector(false, miss);
+    }
+
+    update_follower_policy();
+
+    bool prioritize_instructions;
+
+    if (is_rrip_leader_set(set)) {
+        prioritize_instructions = false;
+    } else if (is_irrip_leader_set(set)) {
+        prioritize_instructions = true;
+    } else {
+        prioritize_instructions = use_irrip;
+    }
+
+    if (hit) {
+        l2_rrpv[set][way] = 0;
+    }
+    else if (prioritize_instructions) {
+        if (isInstruction) {
+            l2_rrpv[set][way] = 1;
+        } else {
+            // Data lines become replacement candidates sooner.
+            l2_rrpv[set][way] = maxIRRPV;
+        }
+    }
+    else {
+        l2_rrpv[set][way] = maxIRRPV - 1;
+    }
+}
+
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "\n========== Dynamic I-RRIP Statistics =========="
+         << endl;
+
+    cout << "\nRRIP leader sets" << endl;
+    cout << "Accesses:            " << rrip_leader_accesses << endl;
+    cout << "Instruction accesses: " << rrip_leader_instr_accesses << endl;
+    cout << "Data accesses:        " << rrip_leader_data_accesses << endl;
+    cout << "Misses:               " << rrip_leader_misses << endl;
+    cout << "Instruction misses:   " << rrip_leader_instr_misses << endl;
+    cout << "Data misses:          " << rrip_leader_data_misses << endl;
+
+    cout << "\nI-RRIP leader sets" << endl;
+    cout << "Accesses:            " << irrip_leader_accesses << endl;
+    cout << "Instruction accesses: " << irrip_leader_instr_accesses << endl;
+    cout << "Data accesses:        " << irrip_leader_data_accesses << endl;
+    cout << "Misses:               " << irrip_leader_misses << endl;
+    cout << "Instruction misses:   " << irrip_leader_instr_misses << endl;
+    cout << "Data misses:          " << irrip_leader_data_misses << endl;
+
+    double rrip_miss_rate = 0.0;
+    double irrip_miss_rate = 0.0;
+
+    if (rrip_leader_accesses > 0) {
+        rrip_miss_rate =
+            static_cast<double>(rrip_leader_misses) /
+            rrip_leader_accesses;
+    }
+
+    if (irrip_leader_accesses > 0) {
+        irrip_miss_rate =
+            static_cast<double>(irrip_leader_misses) /
+            irrip_leader_accesses;
+    }
+
+    double instr_ratio = get_instruction_traffic_ratio();
+
+    cout << "\nLeader miss rates" << endl;
+    cout << "RRIP:   " << rrip_miss_rate << endl;
+    cout << "I-RRIP: " << irrip_miss_rate << endl;
+
+    cout << "\nHybrid selector" << endl;
+    cout << "PSEL: " << psel << " / " << PSEL_MAX << endl;
+    cout << "PSEL preference: "
+         << (psel_prefers_irrip ? "I-RRIP" : "RRIP") << endl;
+    cout << "Instruction traffic ratio: " << instr_ratio << endl;
+    cout << "Threshold: " << INSTR_TRAFFIC_THRESHOLD << endl;
+    cout << "Follower policy: "
+         << (use_irrip ? "I-RRIP" : "RRIP") << endl;
+
+    cout << "==============================================="
+         << endl;
+}
