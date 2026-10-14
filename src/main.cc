@@ -1326,7 +1326,7 @@ int main(int argc, char** argv)
         ooo_cpu[i].L2C.l2c_prefetcher_initialize();
 
 	ooo_cpu[i].L2C.initialize_replacement = &CACHE::l2c_initialize_replacement;
-	ooo_cpu[i].L2C.update_replacement_state = &CACHE::l2c_update_replacement_state;
+	ooo_cpu[i].L2C.l2_update_replacement_state = &CACHE::l2c_update_replacement_state;
 	ooo_cpu[i].L2C.find_victim = &CACHE::l2c_find_victim;
 	ooo_cpu[i].L2C.replacement_final_stats = &CACHE::l2c_replacement_final_stats;
 	(ooo_cpu[i].L2C.*(ooo_cpu[i].L2C.initialize_replacement))();
