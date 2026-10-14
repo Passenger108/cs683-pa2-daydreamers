@@ -1,24 +1,319 @@
 #include "cache.h"
 
+#define IP_TABLE_SETS         64
+#define IP_TABLE_WAYS         4
+#define IP_INDEX_BITS         6      
+#define IP_TABLE_ENTRIES      (IP_TABLE_SETS * IP_TABLE_WAYS)
+#define IP_INDEX(ip)          ((uint32_t)((ip) & (IP_TABLE_SETS - 1)))
+#define IP_TAG(ip)            ((uint16_t)(((ip) >> IP_INDEX_BITS) & 0xFFFF))
 
-void CACHE::l1d_prefetcher_initialize() 
+#define SIG_BITS              10      // 10-bit signature
+#define PATTERN_ENTRIES       (1 << SIG_BITS)
+#define SIG_MASK              (PATTERN_ENTRIES - 1)
+#define SIG_SHIFT             3       // keeps ~4 strides of history in 10 bits
+
+#define PAGE_TAG_MASK         0xFFF   // 12-bit page tag, only to spot a page change
+#define LINES_PER_PAGE        (PAGE_SIZE / BLOCK_SIZE)   // 4096/64 = 64
+
+/**************************************************************************
+A stride must repeat UNIFORM_CONF_MAX times IN A ROW before the uniform path
+is trusted. 
+*****************************************************************************/
+
+#define UNIFORM_CONF_MAX      3
+
+#define PATTERN_CONF_MAX      3       // 2-bit saturating confidence
+#define PATTERN_CONF_PREDICT  2       // predict only when conf >= 2
+
+// Accuracy based throttling.
+#define MAX_DEGREE            8
+#define MIN_DEGREE            1
+#define ACC_WINDOW            100     // re-evaluate every 256 lines actually fetched
+
+
+// --------------------------- the two tables --------------------------------
+
+// One entry per tracked load instruction.
+class IP_ENTRY {
+  public:
+    uint16_t tag;            // 16 b : which IP owns this entry
+    uint8_t  valid;          //  1 b
+    uint16_t last_page;      // 12 b : page tag, only used to detect a page change
+    uint8_t  last_offset;    //  6 b : line offset of the last access in that page
+    int8_t   last_stride;    //  7 b : signed, -63..+63 lines
+    uint8_t  uniform_conf;   //  2 b : how many times last_stride repeated
+    uint16_t signature;      // 10 b : rolling hash of the recent stride sequence
+    uint8_t  lru;            //  2 b : 0 = most recently used within the set
+
+    IP_ENTRY() {
+        tag = 0; 
+        valid = 0; 
+        last_page = 0; 
+        last_offset = 0;
+        last_stride = 0; 
+        uniform_conf = 0; 
+        signature = 0; 
+        lru = 0;
+    };
+};
+
+/**************************************************************************
+signature -> next expected stride.  Direct mapped and tagless: a signature
+collision simply shows up as a low-confidence entry, which we then refuse to
+predict from, so a tag would cost storage to prevent something the
+confidence counter already handles.
+**************************************************************************/
+
+
+class PATTERN_ENTRY {
+  public:
+    int8_t  stride;          // 7 b signed
+    uint8_t conf;            // 2 b saturating
+
+    PATTERN_ENTRY() { stride = 0; conf = 0; };
+};
+
+IP_ENTRY      ip_table[IP_TABLE_SETS][IP_TABLE_WAYS];
+PATTERN_ENTRY pattern_table[PATTERN_ENTRIES];
+
+// ------------------------- throttling state --------------------------------
+int      spp_degree    = MAX_DEGREE;  // 3 b, current aggressiveness
+uint64_t acc_last_pull = 0;           // window snapshots (12 b each in hardware)
+uint64_t acc_last_good = 0;
+
+// ------------------- simulation-only statistics ----------------------------
+uint64_t spp_pf_uniform  = 0;
+uint64_t spp_pf_nonunif  = 0;
+uint64_t spp_windows[MAX_DEGREE + 1] = {0};
+uint64_t spp_acc_sum     = 0;
+uint64_t spp_acc_windows = 0;
+uint64_t spp_ip_allocs   = 0;
+uint64_t spp_ip_hits     = 0;
+uint64_t spp_page_breaks = 0;
+uint64_t spp_chain_stops = 0;
+
+/**************************************************************************
+Roll one stride into the signature.  Shifting left by 3 and XOR-ing in the
+low 7 bits of the stride keeps roughly the last four strides alive inside 10
+bits - enough to tell apart every phase of a period-5 sequence.
+**************************************************************************/
+
+
+uint16_t spp_update_signature(uint16_t sig, int stride)
 {
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    return (uint16_t)(((sig << SIG_SHIFT) ^ (stride & 0x7F)) & SIG_MASK);
 }
+
+void spp_train_pattern(uint16_t sig, int stride)
+{
+    PATTERN_ENTRY &p = pattern_table[sig];
+
+    if (p.conf > 0 && p.stride == stride) {
+        if (p.conf < PATTERN_CONF_MAX) p.conf++;
+    } else if (p.conf == 0) {
+        p.stride = (int8_t)stride;
+        p.conf   = 1;
+    } else {
+        p.conf--;
+    }
+}
+
+
+void CACHE::l1d_prefetcher_initialize()
+{
+    cout << "------------------------------------------------" << endl;
+    cout << "        Stride Pattern Prefetcher (SPP)         " << endl;
+    cout << "------------------------------------------------" << endl;
+    cout << "IP table              : " << IP_TABLE_SETS << " sets x "
+         << IP_TABLE_WAYS << " ways = " << IP_TABLE_ENTRIES << " entries" << endl;
+    cout << "Pattern table         : " << PATTERN_ENTRIES << " entries ("
+         << SIG_BITS << "-bit signature)" << endl;
+    cout << "Degree                : " << MIN_DEGREE << " .. " << MAX_DEGREE
+         << " (accuracy throttled, window = " << ACC_WINDOW << ")" << endl;
+
+    for (int s = 0; s < IP_TABLE_SETS; s++)
+        for (int w = 0; w < IP_TABLE_WAYS; w++)
+            ip_table[s][w].lru = w;
+}
+
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    // train only on load streams
+    if (type != LOAD)
+        return;
+
+    if (pf_lower_level - acc_last_pull >= ACC_WINDOW) {
+        uint64_t pulled = pf_lower_level - acc_last_pull;
+
+        int64_t good = (int64_t)(pf_useful + late_prefetch) - (int64_t)acc_last_good;
+        if(good < 0) 
+            good = 0;
+
+        int acc = (int)((good * 100) / (int64_t)pulled);
+        if(acc > 100) 
+            acc = 100;
+
+        if(acc >= 66)
+            spp_degree = 8;
+        else if(acc >= 50) 
+                spp_degree = 4;
+            else if(acc >= 25) 
+                    spp_degree = 2;
+                else
+                    spp_degree = MIN_DEGREE;
+
+        acc_last_pull = pf_lower_level;
+        acc_last_good = pf_useful + late_prefetch;
+
+        spp_windows[spp_degree]++;
+        spp_acc_sum += acc;
+        spp_acc_windows++;
+    }
+
+    uint16_t page   = (uint16_t)((addr >> LOG2_PAGE_SIZE) & PAGE_TAG_MASK);
+    int      offset = (int)((addr >> LOG2_BLOCK_SIZE) & (LINES_PER_PAGE - 1));
+
+    uint32_t set = IP_INDEX(ip);
+    uint16_t tag = IP_TAG(ip);
+
+    int way = -1;
+    for (int w = 0; w < IP_TABLE_WAYS; w++) {
+        if (ip_table[set][w].valid && ip_table[set][w].tag == tag) {
+            way = w;
+            break;
+        }
+    }
+
+    if (way < 0) {
+        for (int w = 0; w < IP_TABLE_WAYS; w++)
+            if (ip_table[set][w].lru == (IP_TABLE_WAYS - 1)) way = w;
+
+        IP_ENTRY &n = ip_table[set][way];
+        n.valid        = 1;
+        n.tag          = tag;
+        n.last_page    = page;
+        n.last_offset  = (uint8_t)offset;
+        n.last_stride  = 0;
+        n.uniform_conf = 0;
+        n.signature    = 0;
+        spp_ip_allocs++;
+
+        for (int w = 0; w < IP_TABLE_WAYS; w++)
+            if (ip_table[set][w].lru < ip_table[set][way].lru) ip_table[set][w].lru++;
+        ip_table[set][way].lru = 0;
+        return;
+    }
+
+    spp_ip_hits++;
+    IP_ENTRY &e = ip_table[set][way];
+
+    // this IP is being used, so make it most-recently-used in its set
+    for (int w = 0; w < IP_TABLE_WAYS; w++)
+        if (ip_table[set][w].lru < e.lru) ip_table[set][w].lru++;
+    e.lru = 0;
+
+    if (e.last_page != page) {
+        e.last_page   = page;
+        e.last_offset = (uint8_t)offset;
+        spp_page_breaks++;
+        return;
+    }
+
+    int stride = offset - (int)e.last_offset;
+    e.last_page   = page;
+    e.last_offset = (uint8_t)offset;
+
+    if (stride == 0)
+        return;                      // same line twice: nothing to learn
+
+    spp_train_pattern(e.signature, stride);
+    e.signature = spp_update_signature(e.signature, stride);
+
+    if (stride == e.last_stride) {
+        if (e.uniform_conf < UNIFORM_CONF_MAX) e.uniform_conf++;
+    } else {
+        e.uniform_conf = 0;          // hard reset == fall back immediately
+    }
+    e.last_stride = (int8_t)stride;
+
+
+    uint8_t  uniform = (e.uniform_conf == UNIFORM_CONF_MAX) ? 1 : 0;
+    uint16_t sig     = e.signature;
+    int      cum     = 0;            // cumulative lines ahead of `offset`
+
+    for (int i = 0; i < spp_degree; i++) {
+
+        int next_stride;
+
+        if (uniform) {
+            next_stride = e.last_stride;          // same step every time
+        } else {
+            PATTERN_ENTRY &p = pattern_table[sig];
+            if (p.conf < PATTERN_CONF_PREDICT) { spp_chain_stops++; break; }
+            next_stride = p.stride;
+            if (next_stride == 0) { spp_chain_stops++; break; }
+            sig = spp_update_signature(sig, next_stride);   // speculative step
+        }
+
+        cum += next_stride;
+        int pf_offset = offset + cum;
+
+        if (pf_offset < 0 || pf_offset >= LINES_PER_PAGE)
+            break;
+
+        uint64_t pf_addr = (addr & ~((uint64_t)PAGE_SIZE - 1))
+                         | ((uint64_t)pf_offset << LOG2_BLOCK_SIZE);
+
+        if (MSHR.occupancy < (MSHR.SIZE * 0.75))
+            prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+        else
+            prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+
+        if (uniform) spp_pf_uniform++; else spp_pf_nonunif++;
+    }
 }
+
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return;
 }
+
 
 void CACHE::l1d_prefetcher_final_stats()
 {
+    uint64_t total   = spp_pf_uniform + spp_pf_nonunif;
+    uint64_t lookups = spp_ip_hits + spp_ip_allocs;
 
+    cout << endl;
+    cout << "=========== SPP (L1D) final stats ===========" << endl;
+    cout << "SPP prefetches from UNIFORM path     : " << spp_pf_uniform;
+    if (total) cout << "  (" << (100.0 * spp_pf_uniform / total) << "%)";
+    cout << endl;
+    cout << "SPP prefetches from NON-UNIFORM path : " << spp_pf_nonunif;
+    if (total) cout << "  (" << (100.0 * spp_pf_nonunif / total) << "%)";
+    cout << endl;
+
+    cout << "SPP mean windowed usefulness         : "
+         << (spp_acc_windows ? (1.0 * spp_acc_sum / spp_acc_windows) : 0.0)
+         << " %  over " << spp_acc_windows << " windows" << endl;
+
+    cout << "SPP windows spent at degree          :";
+    for (int d = MIN_DEGREE; d <= MAX_DEGREE; d++)
+        cout << "  d" << d << "=" << spp_windows[d];
+    cout << endl;
+
+    uint64_t used = 0;
+    for (int i = 0; i < PATTERN_ENTRIES; i++)
+        if (pattern_table[i].conf >= PATTERN_CONF_PREDICT) used++;
+    cout << "SPP pattern-table entries conf>=" << PATTERN_CONF_PREDICT
+         << "    : " << used << " / " << PATTERN_ENTRIES << endl;
+
+    cout << "SPP IP-table hit rate                : "
+         << (lookups ? (100.0 * spp_ip_hits / lookups) : 0.0)
+         << " %  (" << spp_ip_allocs << " allocations)" << endl;
+    cout << "SPP page-boundary re-anchors         : " << spp_page_breaks << endl;
+    cout << "SPP lookahead chains cut by conf     : " << spp_chain_stops << endl;
+    cout << "=============================================" << endl;
 }
