@@ -15,9 +15,55 @@
 #define DYN_MODE_RRIP  0
 #define DYN_MODE_IRRIP 1
 
+#define DYN_STRIDE (L2C_SET / DYN_NUM_LEADERS)
+#define DYN_FOLLOWER   0
+#define DYN_LEAD_RRIP  1
+#define DYN_LEAD_IRRIP 2
+
+#define DYN_TRANSL 0
+#define DYN_INSTR  1
+#define DYN_DATA   2
+
 uint8_t  dyn_rrpv[L2C_SET][L2C_WAY];
 uint8_t  dyn_mode;
 uint64_t dyn_windows, dyn_win_irrip, dyn_switches, dyn_age_rounds;
+
+static inline int dyn_role(uint32_t set)
+{
+    uint32_t r = set % DYN_STRIDE;
+    if (r == 0)              return DYN_LEAD_IRRIP;
+    if (r == DYN_STRIDE / 2) return DYN_LEAD_RRIP;
+    return DYN_FOLLOWER;
+}
+
+static inline int dyn_mode_of(uint32_t set)
+{
+    int r = dyn_role(set);
+    if (r == DYN_LEAD_RRIP)  return DYN_MODE_RRIP;
+    if (r == DYN_LEAD_IRRIP) return DYN_MODE_IRRIP;
+    return dyn_mode;
+}
+
+static inline int dyn_class(uint32_t type, uint8_t isInstruction)
+{
+    if (type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION || type == TRANSLATION_FROM_L1D)
+        return DYN_TRANSL;
+    if ((type == LOAD || type == PREFETCH) && isInstruction)
+        return DYN_INSTR;
+    return DYN_DATA;
+}
+
+static inline uint8_t dyn_insert_rrpv(int mode, int cls)
+{
+    if (mode == DYN_MODE_RRIP) return DYN_MAX_RRPV - 1;
+    return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
+}
+
+static inline uint8_t dyn_promote_rrpv(int mode, int cls)
+{
+    if (mode == DYN_MODE_RRIP) return 0;
+    return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
+}
 
 void CACHE::l2c_initialize_replacement()
 {
@@ -54,10 +100,13 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     if ((type == WRITEBACK) && ip)
         assert(0);
 
+    int cls  = dyn_class(type, isInstruction);
+    int mode = dyn_mode_of(set);
+
     if (hit)
-        dyn_rrpv[set][way] = 0;
+        dyn_rrpv[set][way] = dyn_promote_rrpv(mode, cls);
     else
-        dyn_rrpv[set][way] = DYN_MAX_RRPV - 1;
+        dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls);
 }
 
 void CACHE::l2c_replacement_final_stats()
