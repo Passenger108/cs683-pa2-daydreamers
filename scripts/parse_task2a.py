@@ -30,6 +30,7 @@ import csv, io, os, re, sys
 
 RESDIR  = sys.argv[1] if len(sys.argv) > 1 else 'results/task2a'
 TRACES  = ['trace1', 'trace2', 'trace3']
+# order matters: the first entry is the speedup denominator
 CONFIGS = [('lru_t2a', 'LRU (baseline)'),
            ('rrip',    'RRIP (supplied)'),
            ('irrip',   'I-RRIP (ours)')]
@@ -77,6 +78,10 @@ def expected_irrip_config():
 
 EXPECTED_CFG = expected_irrip_config()
 
+# Let run_task2a.sh ask for this string, so its resume logic can tell a log
+# produced by the CURRENT I-RRIP configuration from one produced by an older
+# set of knob values.  Without it, changing a #define leaves stale logs that
+# "reached the Region of Interest" and are therefore skipped as complete.
 if '--print-expected-config' in sys.argv:
     print(EXPECTED_CFG or '')
     sys.exit(0)
@@ -87,6 +92,7 @@ def parse(path):
     t = io.open(path, encoding='utf-8', errors='replace').read()
     d = {}
 
+    # --- IPC: the Region-of-Interest value, never the warmup heartbeats ------
     roi = t.find('Region of Interest Statistics')
     if roi < 0:
         raise ValueError('%s: no Region of Interest section (run incomplete)' % path)
@@ -98,6 +104,7 @@ def parse(path):
     d['instrs'] = int(m.group(2))
     d['cycles'] = int(m.group(3))
 
+    # --- L2C load: exact access/hit/miss counts ------------------------------
     m = re.search(r'^L2C LOAD\s+ACCESS:\s*(\d+)\s+HIT:\s*(\d+)\s+MISS:\s*(\d+)', tail, re.M)
     d['l2c_load_access'] = int(m.group(1))
     d['l2c_load_hit']    = int(m.group(2))
@@ -107,6 +114,11 @@ def parse(path):
     d['l2c_total_access'] = int(m.group(1))
     d['l2c_total_miss']   = int(m.group(3))
 
+    # --- the two split MPKIs, exactly as main.cc prints them -----------------
+    # These printed values ARE the graded numbers, so they are taken verbatim
+    # rather than recomputed.  main.cc prints at 6 significant figures, so the
+    # miss counts reconstructed from them below can be off by +/-1 line; the
+    # MPKIs themselves are not.
     d['mpki_instr'] = num(re.search(r'^L2C INSTRUCTION LOAD MPKI:\s*([\d.]+)', tail, re.M).group(1))
     d['mpki_data']  = num(re.search(r'^L2C DATA LOAD MPKI:\s*([\d.]+)',        tail, re.M).group(1))
 
@@ -119,6 +131,7 @@ def parse(path):
     m = re.search(r'^L2C AVERAGE MISS LATENCY:\s*([\d.]+)', tail, re.M)
     d['miss_latency'] = num(m.group(1)) if m else float('nan')
 
+    # --- the nine eviction-conflict counters ChampSim already keeps ----------
     for killer, victim in EVICT_PAIRS:
         m = re.search(r'^L2C %s Evicting %s\s+(\d+)' % (killer, victim), tail, re.M)
         d['ev_%s_%s' % (killer[:5].lower(), victim[:5].lower())] = int(m.group(1)) if m else 0
@@ -126,8 +139,10 @@ def parse(path):
     d['victims_data']  = (d['ev_instr_data']  + d['ev_trans_data']  + d['ev_data_data'])
     d['victims_trans'] = (d['ev_instr_trans'] + d['ev_trans_trans'] + d['ev_data_trans'])
 
+    # --- I-RRIP's own counters, when the policy is I-RRIP --------------------
     m = re.search(r'^L2C I-RRIP config\s+(.*)$', t, re.M)
     d['irrip_config'] = m.group(1).strip() if m else ''
+    # Identity gate, applied only to I-RRIP logs.
     if os.path.basename(path).startswith('irrip_'):
         if not d['irrip_config']:
             raise ValueError(
@@ -161,6 +176,7 @@ def mean(xs):
     return sum(xs) / float(len(xs))
 
 
+# ---------------------------------------------------------------- load -------
 data, missing = {}, []
 for cfg, _ in CONFIGS:
     for tr in TRACES:
@@ -186,6 +202,7 @@ for (cfg, tr), d in data.items():
     b = data.get((BASE, tr))
     d['speedup'] = d['ipc'] / b['ipc'] if b else float('nan')
 
+# ----------------------------------------------------------------- csv -------
 os.makedirs(RESDIR, exist_ok=True)
 cols = (['config', 'trace', 'ipc', 'speedup', 'mpki_l2c_load', 'mpki_instr', 'mpki_data',
          'mpki_l2c_total', 'l2c_load_access', 'l2c_load_hit', 'l2c_load_miss',
@@ -206,6 +223,7 @@ with io.open(csv_path, 'w', newline='', encoding='utf-8') as fh:
             w.writerow([cfg, tr] + [d.get(c, '') for c in cols[2:]])
 print('wrote', csv_path)
 
+# -------------------------------------------------------------- tables -------
 out = []
 A = out.append
 A('# Task 2a - Instruction-Conscious L2 Replacement (I-RRIP): results\n')
@@ -244,6 +262,7 @@ table('L2 DATA load MPKI',
       'Task 2b exists to fix.',
       '%.4f', 'mpki_data', ('mean', mean))
 
+# --- the analysis table: what moved, and in which direction ------------------
 if 'lru_t2a' in have:
     A('### What changed, per trace\n')
     A('Instruction-MPKI reduction is the goal; data-MPKI change is the cost.')
@@ -266,6 +285,7 @@ if 'lru_t2a' in have:
                 d['mpki_l2c_load'], pct(d['mpki_l2c_load'], b['mpki_l2c_load'])))
     A('')
 
+# --- eviction conflicts: the mechanism, not just the outcome ----------------
 A('### Eviction conflicts (ChampSim\'s own counters)\n')
 A('`data->instr` is the number of times a data fill threw out an instruction')
 A('line. That is the quantity I-RRIP is built to reduce, so it is the direct')
@@ -283,6 +303,7 @@ for cfg in have:
             d['ev_instr_instr'], d['ev_trans_instr'], d['victims_data']))
 A('')
 
+# --- I-RRIP internals -------------------------------------------------------
 if any(('irrip', t) in data for t in TRACES):
     A('### I-RRIP internals\n')
     cfgline = data[('irrip', TRACES[0])]['irrip_config'] if ('irrip', TRACES[0]) in data else ''
@@ -304,6 +325,7 @@ md_path = os.path.join(RESDIR, 'task2a_tables.md')
 io.open(md_path, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
 print('wrote', md_path)
 
+# ------------------------------------------------------------ console --------
 print('\n%-16s %-8s %8s %8s %10s %10s %10s' % ('config', 'trace', 'IPC', 'speedup',
                                                'L2C MPKI', 'instr', 'data'))
 for cfg in have:

@@ -47,15 +47,23 @@ N_WARM = N_SIM = 25000000
 
 BINPRE  = 'bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-irrip_sweep-lru-lru-lru-lru-1core-'
 
+# The centre point: the shipped I-RRIP defaults.  Every variant below is this
+# dictionary with one or two entries changed.
 CENTRE = dict(MAX_RRPV=3,
               INSERT_INSTR=0, INSERT_DATA=2, INSERT_TRANSL=2,
               PROMOTE_INSTR=0, PROMOTE_DATA=0, PROMOTE_TRANSL=0,
               EVICT_PREFER_DATA=0, EVICT_SLACK=0,
               WB_PROMOTES=1)
 
+# (group, id, what question this row answers, overrides)
 VARIANTS = [
  ('base', 'base', 'the shipped I-RRIP defaults', {}),
 
+ # ---- A: how wide should the RRPV be? -------------------------------------
+ # The user asked for the 0..7 range.  0 is excluded by construction (see the
+ # comment on IRRIP_MAX_RRPV in the policy); the storage-meaningful widths are
+ # 1, 3 and 7 bits-worth.  Note max=1 needs data at 1, not at max-1=0, because
+ # max-1=0 would make instruction and data insertion identical, i.e. no bias.
  ('A', 'max1',   '1-bit RRPV: is a single bit of protection enough?',
       dict(MAX_RRPV=1, INSERT_INSTR=0, INSERT_DATA=1, INSERT_TRANSL=1)),
  ('A', 'max7',   '3-bit RRPV: does a longer deadline help?',
@@ -63,40 +71,76 @@ VARIANTS = [
  ('A', 'max7mid','3-bit RRPV, instructions not pinned at the top',
       dict(MAX_RRPV=7, INSERT_INSTR=2, INSERT_DATA=6, INSERT_TRANSL=6)),
 
+ # ---- B: where should an instruction line be inserted? --------------------
  ('B', 'ins_i1', 'instructions at 1: keep RRPV 0 for proven reuse only',
       dict(INSERT_INSTR=1)),
  ('B', 'ins_i2', 'instructions at 2 = NO bias at all; must reproduce RRIP exactly',
       dict(INSERT_INSTR=2)),
 
+ # ---- C: should data be demoted as well as instructions promoted? ---------
  ('C', 'ins_d3', 'data inserted evict-next: protect instructions by demoting data',
       dict(INSERT_DATA=3)),
  ('C', 'ins_d1', 'data MORE protected than SRRIP (reverse control)',
       dict(INSERT_DATA=1)),
 
+ # ---- D: are address translations frontend-critical too? ------------------
+ # 6-10% of instruction-line evictions on these traces are caused by a
+ # translation fill, and an instruction page walk stalls the frontend as surely
+ # as an instruction miss does.
  ('D', 'tr_instr', 'translations treated like instructions', dict(INSERT_TRANSL=0)),
  ('D', 'tr_evict', 'translations inserted evict-next',       dict(INSERT_TRANSL=3)),
 
+ # ---- E: should promotion be type-aware? ----------------------------------
+ # The policy argues promotion should stay type-blind because a hit is evidence
+ # rather than a guess.  iTP (ASPLOS'25) disagrees and weakens data promotion.
+ # These three rows settle it on our traces instead of by argument.
  ('E', 'pro_d1', 'data hits promote to 1, not 0 (weakened, iTP-style)', dict(PROMOTE_DATA=1)),
  ('E', 'pro_d2', 'data hits promote to 2 (strongly weakened)',          dict(PROMOTE_DATA=2)),
  ('E', 'pro_i1', 'instruction hits promote to 1 (reverse control)',     dict(PROMOTE_INSTR=1)),
 
+ # ---- F: should eviction look at the type bit? ----------------------------
+ # Default is no.  Slack 0 = "same candidates RRIP would pick from, prefer a
+ # data one"; slack 1-2 = "evict a data line that is not yet due to spare an
+ # instruction line that is" (xPTP's bounded diversion).
  ('F', 'ev_s0', 'eviction prefers data, no slack',   dict(EVICT_PREFER_DATA=1, EVICT_SLACK=0)),
  ('F', 'ev_s1', 'eviction prefers data, slack 1',    dict(EVICT_PREFER_DATA=1, EVICT_SLACK=1)),
  ('F', 'ev_s2', 'eviction prefers data, slack 2',    dict(EVICT_PREFER_DATA=1, EVICT_SLACK=2)),
 
+ # ---- G: does a writeback hit deserve a promotion? ------------------------
+ # LRU says no ("writeback hit does not update LRU state"); the supplied RRIP
+ # says yes. We keep RRIP's answer so the comparison is clean, and measure it.
  ('G', 'wb0', 'writeback hits do not promote (LRU\'s view)', dict(WB_PROMOTES=0)),
 
+ # ======================= STAGE 2 ========================================
+ # Stage 1 produced two findings that it could not itself resolve:
+ #
+ #  (a) In EVERY group the most aggressive setting was best on the 3-trace
+ #      aggregate. "The most extreme value I tried won" is not a stopping
+ #      point -- the turning point has not been bracketed. Group I pushes
+ #      past Stage 1's reach: slack is capped below maxRRPV, so slack > 2
+ #      needs a 3-bit RRPV.
+ #  (b) Every knob moves the SAME single axis (how hard to favour
+ #      instructions) at a near-constant exchange rate of ~0.5 data misses
+ #      per instruction miss saved. Whether two moderate knobs compose or
+ #      merely slide to the same point on that axis is untested. Group H
+ #      combines the knobs that each helped WITHOUT regressing trace1.
+ #
+ # Group H -- do the non-regressing moderate knobs compose?
  ('H', 'ev0_prod2', 'eviction preference + weakened data promotion',
       dict(EVICT_PREFER_DATA=1, EVICT_SLACK=0, PROMOTE_DATA=2)),
  ('H', 'ev0_wb0', 'eviction preference + no writeback promotion',
       dict(EVICT_PREFER_DATA=1, EVICT_SLACK=0, WB_PROMOTES=0)),
  ('H', 'ev0_trev', 'eviction preference + translations evict-next',
       dict(EVICT_PREFER_DATA=1, EVICT_SLACK=0, INSERT_TRANSL=3)),
+ # The three knobs that each improved every metric WITHOUT regressing any
+ # single trace in Stage 1 were ev_s0, wb0 and tr_evict.  This row is the
+ # leading candidate for the shipped configuration, so it matters most.
  ('H', 'ev0_wb0_trev', 'all three CLEAN (non-regressing) winners together',
       dict(EVICT_PREFER_DATA=1, EVICT_SLACK=0, WB_PROMOTES=0, INSERT_TRANSL=3)),
  ('H', 'ev0_prod2_wb0', 'ev_s0 + wb0 + weakened data promotion (pro_d2 alone regressed trace1)',
       dict(EVICT_PREFER_DATA=1, EVICT_SLACK=0, PROMOTE_DATA=2, WB_PROMOTES=0)),
 
+ # Group I -- bracket the far end, and squeeze the cheapest configuration
  ('I', 'max7_ev4', '3-bit RRPV, eviction slack 4 (beyond Stage 1 reach)',
       dict(MAX_RRPV=7, INSERT_INSTR=0, INSERT_DATA=6, INSERT_TRANSL=6,
            EVICT_PREFER_DATA=1, EVICT_SLACK=4)),
@@ -112,6 +156,7 @@ VARIANTS = [
 ]
 
 
+# --------------------------------------------------------------------------
 def write_variant(knobs):
     """Copy the policy, pinning EVERY knob to CENTRE plus this variant's overrides.
 
@@ -202,6 +247,7 @@ def run_all(binp, vid, trace_dir, jobs):
         p.wait(); fh.close()
 
 
+# ---------------------------------------------------------------- summary ----
 def grab(text, pat, cast=float, default=None):
     m = re.search(pat, text, re.M)
     return cast(m.group(1)) if m else default
@@ -247,6 +293,7 @@ def geomean(xs):
 
 
 def summarise(selected):
+    # Speedup denominator: the LRU baseline from the main Task 2a run.
     base = {}
     for t in TRACES:
         p = 'results/task2a/lru_t2a_%s.txt' % t
@@ -269,6 +316,7 @@ def summarise(selected):
                     per[t] = d
         if len(per) < len(TRACES):
             continue
+        # refuse to report a run whose compiled config is not what we asked for
         want = expected_cfg(knobs)
         got = per[TRACES[0]]['cfg'].strip()
         if got and got != want:
@@ -307,6 +355,12 @@ def summarise(selected):
             r['grp'], r['vid'], r['desc'],
             ('%.4f' % r['speedup']) if r['speedup'] else '-',
             r['m_l2c'], r['m_instr'], r['m_data'], r['dei'], r['evpref'], r['bytes']))
+    # ---- per-trace table -------------------------------------------------
+    # The 3-trace mean above hid a real regression once: the most aggressive
+    # variants looked best on aggregate while making trace1 WORSE than plain
+    # LRU, because their whole gain came from trace2.  An aggregate that can
+    # conceal a regression is a misleading summary, so every row is also
+    # broken out per trace, with an explicit REGRESSES flag.
     bl = {}
     for t_ in TRACES:
         p_ = 'results/task2a/lru_t2a_%s.txt' % t_
@@ -340,7 +394,7 @@ def summarise(selected):
             for t_ in TRACES:
                 d_ = r['per'][t_]
                 line += ' %.3f | %.3f | %.4f |' % (d_['m_instr'], d_['m_l2c'], r['sp_per'][t_])
-                if d_['m_l2c'] > bl[t_]['m_l2c'] * 1.001:
+                if d_['m_l2c'] > bl[t_]['m_l2c'] * 1.001:   # 0.1% tolerance
                     worse.append(t_)
             out.append(line + (' **REGRESSES %s** |' % ','.join(worse) if worse else ' clean |'))
         out.append('')
@@ -353,6 +407,7 @@ def summarise(selected):
     print('\nwrote %s  (%d variants tabulated)' % (p, len(rows)))
 
 
+# ------------------------------------------------------------------- main ----
 def main():
     args = sys.argv[1:]
     only = None
@@ -399,8 +454,14 @@ def main():
             if binp:
                 run_all(binp, vid, trace_dir, jobs)
         if os.path.exists(VAR):
-            os.remove(VAR)
+            os.remove(VAR)   # leave no half-configured policy behind
 
+    # Always tabulate EVERY variant whose logs exist, not just the ones this
+    # invocation ran.  Passing `selected` here meant that running one group
+    # (e.g. --only H,I) rewrote sweep_summary.md with only that group's rows
+    # and silently discarded every earlier row -- turning a resumable sweep
+    # into one that destroys its own history.  summarise() already skips
+    # variants whose three logs are not all present, so this is safe.
     summarise(VARIANTS)
 
 

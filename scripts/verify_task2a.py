@@ -36,6 +36,8 @@ CACHEH = read('inc/cache.h')
 CACHEC = read('src/cache.cc')
 
 print('\n== 1. knob defaults in the source match the table in the design doc ==')
+# (knob, literal expected in source, what the doc's table says)
+# The shipped configuration after the 26-variant sweep: the `max1_prod1` row.
 WANT = [('MAX_RRPV', '1', '1'), ('INSERT_INSTR', '0', '0'),
         ('INSERT_DATA', 'IRRIP_MAX_RRPV', 'max'),
         ('INSERT_TRANSL', 'IRRIP_MAX_RRPV', 'max'),
@@ -118,10 +120,18 @@ for f in files:
 check('all %d update_replacement_state definitions have 9 params' % len(sigs),
       all(k == 9 for _, k in sigs),
       str([s for s in sigs if s[1] != 9]))
+# 27 EDITED is the stable claim; the tree total grows with every policy file
+# added (rrip shipped correct, irrip is Task 2a, dyn_irrip is Task 2b), so
+# asserting it would go stale on every new task.  The invariant that matters
+# is checked just above: every definition found has 9 parameters.
 check('design doc claims 27 EDITED declarations',
       '27 declarations' in DD and '**27**' in DD)
 check('%d nine-param definitions now in tree (grows as policies are added)' % len(sigs),
       len(sigs) >= 29, 'counted %d across %d files' % (len(sigs), len(files)))
+# TREE-WIDE, keyed on the callee rather than on one calling idiom.  The first
+# version of this check grepped `this->*update_replacement_state` in cache.cc
+# alone, found 6, and was blind to the three BTB sites in src/ooo_cpu.cc that
+# call through `(BTB.*BTB.update_replacement_state)(...)`.  The build failed.
 calls = []
 for f in sorted(glob.glob('src/*.cc')):
     body = read(f)
@@ -139,6 +149,8 @@ check('the three BTB sites are in src/ooo_cpu.cc',
 check('design doc documents 9 call sites', 'The 9 call sites' in DD)
 
 print('\n== 6. policy line count claimed in the docs ==')
+# read the claim out of the doc instead of hard-coding it, so this check can
+# never itself go stale the way the doc did
 n = len(POLICY.rstrip('\n').split('\n'))
 claimed = re.search(r'(\d+) lines, all knobs in one block', RUN)
 check('run doc\'s line count for irrip.l2c_repl matches the file (%d)' % n,
@@ -203,6 +215,8 @@ for s in ['run_task2a.sh', 'parse_task2a.py', 'plot_task2a.py', 'sweep_task2a.py
 print('\n== 9. sweep variant count claimed in the docs ==')
 sw = read('scripts/sweep_task2a.py')
 nvar = len(re.findall(r"^ \('", sw, re.M))
+# Derive, never hard-code: the hard-coded 17/51 went stale the moment Stage 2
+# was added, which is exactly the failure mode this script exists to catch.
 check('both docs state the live variant count (%d)' % nvar,
       ('%d variants' % nvar) in DD and ('%d variants' % nvar) in RUN,
       'docs disagree with the %d variants in sweep_task2a.py' % nvar)
@@ -211,6 +225,12 @@ check('run doc states the live simulation count (%d)' % (nvar * 3),
 
 print('\n== 10. the three harness gates added after the first bad run (13) ==')
 MAINC = read('src/main.cc').split('\n')
+# the single-core loop must call the L2C replacement final-stats hook; ChampSim
+# only calls it inside `if (NUM_CPUS > 1)`, so single-core runs printed nothing
+# The single-core loop is the one holding the SECOND l1d_prefetcher_final_stats()
+# call (the first is inside `if (NUM_CPUS > 1)`).  Assert the L2C replacement
+# hook is called in that same loop -- anchoring on a sibling call that is known
+# to work beats guessing a line-number offset.
 l1d = [i+1 for i,l in enumerate(MAINC) if 'l1d_prefetcher_final_stats()' in l]
 l2r = [i+1 for i,l in enumerate(MAINC) if 'l2c_replacement_final_stats()' in l]
 check('ChampSim still has exactly one multi-core-only call site to work around',
@@ -230,6 +250,8 @@ PA = read('scripts/parse_task2a.py')
 check('parse_task2a.py reconstructs and enforces the I-RRIP config identity',
       'expected_irrip_config' in PA and 'EXPECTED_CFG' in PA
       and 'has no "L2C I-RRIP config" line' in PA)
+# The shipped defaults must be exactly one of the swept variants, or the
+# headline numbers would come from a configuration never measured.
 import importlib.util as _ilu
 _s = _ilu.module_from_spec(_ilu.spec_from_file_location('swv', 'scripts/sweep_task2a.py'))
 _ilu.spec_from_file_location('swv', 'scripts/sweep_task2a.py').loader.exec_module(_s)
@@ -255,7 +277,14 @@ check('design doc records all three harness failures',
       '## 13. Three ways the harness lied' in DD and '13.1' in DD and '13.2' in DD and '13.3' in DD)
 
 print('\n== 11. every number quoted in design-doc 14 matches the logs ==')
+# The doc formats large numbers with thin/ordinary spaces as digit groupers
+# ("200 049"), so the presence test runs against a de-grouped copy.  Without
+# this the check fails on formatting while the arithmetic is right -- a false
+# alarm is as corrosive to a self-audit as a missed error.
 DDN = re.sub(r'(?<=\d)[ \u2009\u202f\u00a0](?=\d)', '', DD)
+# The Task-1 lesson: the errors that survive review are real numbers attached
+# to the wrong claim.  So every figure 14 states is recomputed here from
+# results/task2a/*.txt and results/task2a_sweep/*.txt.
 TRS = ['trace1', 'trace2', 'trace3']
 
 
@@ -302,6 +331,7 @@ if all(os.path.exists('results/task2a/%s_%s.txt' % (c, t_))
        for c in ('lru_t2a', 'rrip', 'irrip') for t_ in TRS):
     R = {c: {t_: _m('results/task2a/%s_%s.txt' % (c, t_)) for t_ in TRS}
          for c in ('lru_t2a', 'rrip', 'irrip')}
+    # ---- 14.1 headline table -------------------------------------------
     for cfg, mi, md, ml, sp in (('lru_t2a', '10.1050', '6.2305', '16.3356', '1.0000'),
                                 ('rrip',    '9.8467',  '5.9613', '15.8080', '1.0004'),
                                 ('irrip',   '6.2219',  '8.5371', '14.7590', '1.0138')):
@@ -313,10 +343,13 @@ if all(os.path.exists('results/task2a/%s_%s.txt' % (c, t_))
         check('14.1 %-8s data  %s' % (cfg, md), md in DD and abs(float(md) - gd) < 5e-5, 'computed %.5f' % gd)
         check('14.1 %-8s L2C   %s' % (cfg, ml), ml in DD and abs(float(ml) - gl) < 5e-5, 'computed %.5f' % gl)
         check('14.1 %-8s spdup %s' % (cfg, sp), sp in DD and abs(float(sp) - gs) < 5e-5, 'computed %.5f' % gs)
+    # ---- 14.1 per-trace + eviction counters ----------------------------
     for t_, want in (('trace1', ('9.238', '9.996', '19.234', '0.9967', 200049, 103643, 77919)),
                      ('trace2', ('8.715', '12.344', '21.058', '1.0384', 189603, 70729, 103316)),
                      ('trace3', ('0.713', '3.271', '3.985', '1.0068', 16064, 8580, 5650))):
         r = R['irrip'][t_]
+        # 3-dp values in the doc are rounded, so the tolerance is half a unit
+        # in the last place quoted, i.e. 5e-4 inclusive -> use 1e-3 strictly.
         check('14.1 %s instr %s' % (t_, want[0]), want[0] in DD and abs(float(want[0]) - r['i']) < 1e-3, '%.4f' % r['i'])
         check('14.1 %s data %s' % (t_, want[1]), want[1] in DD and abs(float(want[1]) - r['d']) < 1e-3, '%.4f' % r['d'])
         check('14.1 %s L2C %s' % (t_, want[2]), want[2] in DD and abs(float(want[2]) - r['l2c']) < 1e-3, '%.4f' % r['l2c'])
@@ -327,14 +360,17 @@ if all(os.path.exists('results/task2a/%s_%s.txt' % (c, t_))
               'computed %d' % (r['dei'] + r['iei'] + r['tei']))
         check('14.1 %s d->i %d' % (t_, want[5]), str(want[5]) in DDN and r['dei'] == want[5], '%d' % r['dei'])
         check('14.1 %s i->i %d' % (t_, want[6]), str(want[6]) in DDN and r['iei'] == want[6], '%d' % r['iei'])
+    # ---- 14.2 reuse density --------------------------------------------
     for t_, wi, wd in (('trace1', '0.54', '0.13'), ('trace2', '3.06', '0.19'), ('trace3', '1.12', '0.12')):
         r = R['irrip'][t_]
         ri = r['pro_i'] / float(r['ins_i']); rd = r['pro_d'] / float(r['ins_d'])
         check('14.2 %s instr reuse %s' % (t_, wi), wi in DD and abs(float(wi) - ri) < 5e-3, '%.3f' % ri)
         check('14.2 %s data reuse %s' % (t_, wd), wd in DD and abs(float(wd) - rd) < 5e-3, '%.3f' % rd)
+    # ---- 14.6 storage ---------------------------------------------------
     check('14.6 storage 1024 B, printed by the run',
           R['irrip']['trace1']['bytes'] == 1024 and '1024B' in DDN.replace(' B', 'B')
           and 'total_bytes 1024' in DD)
+    # ---- 14.5 the alternative, from the sweep logs ----------------------
     if all(os.path.exists('results/task2a_sweep/ev0_wb0_trev_%s.txt' % t_) for t_ in TRS):
         A = {t_: _m('results/task2a_sweep/ev0_wb0_trev_%s.txt' % t_) for t_ in TRS}
         ai = _mean([A[t_]['i'] for t_ in TRS]); al = _mean([A[t_]['l2c'] for t_ in TRS])
@@ -342,6 +378,7 @@ if all(os.path.exists('results/task2a/%s_%s.txt' % (c, t_))
         check('14.5 ev0_wb0_trev instr 7.776', '7.776' in DD and abs(7.776 - ai) < 5e-4, '%.4f' % ai)
         check('14.5 ev0_wb0_trev L2C 14.384', '14.384' in DD and abs(14.384 - al) < 5e-4, '%.4f' % al)
         check('14.5 ev0_wb0_trev spdup 1.0069', '1.0069' in DD and abs(1.0069 - asp) < 5e-5, '%.5f' % asp)
+    # ---- 14.4 the IPC/MPKI paradox pair ---------------------------------
     if all(os.path.exists('results/task2a_sweep/max7_ev4_%s.txt' % t_) for t_ in TRS):
         B = {t_: _m('results/task2a_sweep/max7_ev4_%s.txt' % t_) for t_ in TRS}
         bl = _mean([B[t_]['l2c'] for t_ in TRS])
@@ -354,6 +391,8 @@ else:
     print('  SKIP  results/task2a incomplete')
 
 print('\n== 12. every translation unit front-end-compiles, for all 3 policies ==')
+# A per-file check on only the files I edited is what let a broken
+# src/ooo_cpu.cc through.  Compile everything the Makefile compiles.
 import shutil, subprocess
 units = sorted(subprocess.run(['find', 'src', 'branch', 'replacement', 'prefetcher',
                                '-name', '*.cc'], stdout=subprocess.PIPE
