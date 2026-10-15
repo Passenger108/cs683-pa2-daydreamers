@@ -1,0 +1,215 @@
+#include "cache.h"
+
+#define DYN_SEL_PDF  0
+#define DYN_SEL_PSEL 1
+
+#ifndef DYN_SELECTOR
+#define DYN_SELECTOR DYN_SEL_PSEL
+#endif
+
+#ifndef DYN_HYST_PCT
+#define DYN_HYST_PCT 3
+#endif
+
+#ifndef DYN_INSTR_WEIGHT
+#define DYN_INSTR_WEIGHT 2
+#endif
+
+#define DYN_PSEL_BITS 10
+#define DYN_PSEL_MAX  ((1u << DYN_PSEL_BITS) - 1u)
+#define DYN_PSEL_MID  (1u << (DYN_PSEL_BITS - 1))
+
+uint32_t dyn_psel = DYN_PSEL_MID;
+
+#ifndef DYN_MAX_RRPV
+#define DYN_MAX_RRPV 3
+#endif
+
+#ifndef DYN_NUM_LEADERS
+#define DYN_NUM_LEADERS 8
+#endif
+
+#ifndef DYN_WINDOW
+#define DYN_WINDOW 8192
+#endif
+
+#define DYN_MODE_RRIP  0
+#define DYN_MODE_IRRIP 1
+
+#ifndef DYN_THRESH_PCT
+#define DYN_THRESH_PCT 25
+#endif
+
+uint64_t dyn_acc[3], dyn_mis[3]; 
+uint64_t dyn_tot[3], dyn_tmis[3]; 
+uint64_t dyn_ctr = 0;
+
+#define DYN_STRIDE (L2C_SET / DYN_NUM_LEADERS)
+#define DYN_FOLLOWER   0
+#define DYN_LEAD_RRIP  1
+#define DYN_LEAD_IRRIP 2
+
+#define DYN_TRANSL 0
+#define DYN_INSTR  1
+#define DYN_DATA   2
+
+uint8_t  dyn_rrpv[L2C_SET][L2C_WAY];
+uint8_t  dyn_mode;
+uint64_t dyn_windows, dyn_win_irrip, dyn_switches, dyn_age_rounds;
+
+static inline int dyn_role(uint32_t set)
+{
+    uint32_t r = set % DYN_STRIDE;
+    if (r == 0)              return DYN_LEAD_IRRIP;
+    if (r == DYN_STRIDE / 2) return DYN_LEAD_RRIP;
+    return DYN_FOLLOWER;
+}
+
+static inline int dyn_mode_of(uint32_t set)
+{
+    int r = dyn_role(set);
+    if (r == DYN_LEAD_RRIP)  return DYN_MODE_RRIP;
+    if (r == DYN_LEAD_IRRIP) return DYN_MODE_IRRIP;
+    return dyn_mode;
+}
+
+static inline int dyn_class(uint32_t type, uint8_t isInstruction)
+{
+    if (type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION || type == TRANSLATION_FROM_L1D)
+        return DYN_TRANSL;
+    if ((type == LOAD || type == PREFETCH) && isInstruction)
+        return DYN_INSTR;
+    return DYN_DATA;
+}
+
+static inline uint8_t dyn_insert_rrpv(int mode, int cls)
+{
+    if (mode == DYN_MODE_RRIP) return DYN_MAX_RRPV - 1;
+    return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
+}
+
+static inline uint8_t dyn_promote_rrpv(int mode, int cls)
+{
+    if (mode == DYN_MODE_RRIP) return 0;
+    return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
+}
+
+static void dyn_end_of_window(void)
+{
+    dyn_windows++;
+    int next = dyn_mode;
+
+#if DYN_SELECTOR == DYN_SEL_PDF
+    uint64_t ia = dyn_acc[DYN_INSTR], im = dyn_mis[DYN_INSTR];
+    uint64_t ta = ia + dyn_acc[DYN_DATA] + dyn_acc[DYN_TRANSL];
+    uint64_t tm = im + dyn_mis[DYN_DATA] + dyn_mis[DYN_TRANSL];
+    int bar = (dyn_mode == DYN_MODE_IRRIP) ? (DYN_THRESH_PCT - DYN_HYST_PCT) 
+                                          : (DYN_THRESH_PCT + DYN_HYST_PCT);
+    if (bar < 0) bar = 0; else if (bar > 100) bar = 100;
+
+    if (ta + tm > 0)
+        next = ((ia + im) * 100ULL > (uint64_t)bar * (ta + tm)) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
+#else
+    /* PSEL duel: low PSEL means I-RRIP leader sets had fewer misses -> I-RRIP wins */
+    next = (dyn_psel < DYN_PSEL_MID) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
+#endif
+
+    if (next != dyn_mode) dyn_switches++;
+    dyn_mode = next;
+    if (dyn_mode == DYN_MODE_IRRIP) dyn_win_irrip++;
+
+    /* Halve windowed counters and pull PSEL back towards neutral */
+    for (int c = 0; c < 3; c++) { 
+        dyn_acc[c] >>= 1; 
+        dyn_mis[c] >>= 1; 
+    }
+    dyn_psel = (uint32_t)((int)DYN_PSEL_MID + ((int)dyn_psel - (int)DYN_PSEL_MID) / 2);
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            dyn_rrpv[i][j] = DYN_MAX_RRPV;
+        }
+    }
+    dyn_mode = DYN_MODE_RRIP;
+    dyn_psel = DYN_PSEL_MID;
+    dyn_windows = dyn_win_irrip = dyn_switches = dyn_age_rounds = dyn_ctr = 0;
+    for (int c = 0; c < 3; c++) {
+        dyn_acc[c] = dyn_mis[c] = dyn_tot[c] = dyn_tmis[c] = 0;
+    }
+
+    cout << NAME << " DYN-IRRIP initialized. MAX_RRPV: " << DYN_MAX_RRPV 
+         << " LEADERS: " << DYN_NUM_LEADERS 
+         << " THRESH_PCT: " << DYN_THRESH_PCT << endl;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1) {
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (dyn_rrpv[set][i] == DYN_MAX_RRPV)
+                return i;
+        }
+        for (int i = 0; i < L2C_WAY; i++) {
+            dyn_rrpv[set][i]++;
+        }
+        dyn_age_rounds++;
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    int cls  = dyn_class(type, isInstruction);
+    int role = dyn_role(set);
+    int mode = dyn_mode_of(set);
+
+    /* Track traffic on unbiased RRIP leader sets */
+    if (type == LOAD) {
+        if (role == DYN_LEAD_RRIP) {
+            dyn_acc[cls]++;
+            if (!hit) dyn_mis[cls]++;
+            dyn_tot[cls]++;
+            if (!hit) dyn_tmis[cls]++;
+        }
+        #if DYN_SELECTOR == DYN_SEL_PSEL
+            if (!hit) {
+                int w = (cls == DYN_INSTR) ? DYN_INSTR_WEIGHT : 1;
+                int d = (role == DYN_LEAD_IRRIP) ? +w : (role == DYN_LEAD_RRIP ? -w : 0);
+                int v = (int)dyn_psel + d;
+                dyn_psel = (uint32_t)(v < 0 ? 0 : (v > (int)DYN_PSEL_MAX ? (int)DYN_PSEL_MAX : v));
+            }
+        #endif
+        if (++dyn_ctr >= DYN_WINDOW) {
+            dyn_end_of_window();
+            dyn_ctr = 0;
+        }
+    }
+
+    if (hit)
+        dyn_rrpv[set][way] = dyn_promote_rrpv(mode, cls);
+    else
+        dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls);
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << NAME << " DYN MODE windows " << dyn_windows
+         << " in_irrip " << dyn_win_irrip
+         << " pct_irrip " << (dyn_windows ? (100.0 * dyn_win_irrip / dyn_windows) : 0.0)
+         << " switches " << dyn_switches << endl;
+    cout << NAME << " DYN COUNTERS instr_acc " << dyn_tot[DYN_INSTR]
+         << " instr_miss " << dyn_tmis[DYN_INSTR]
+         << " data_acc " << dyn_tot[DYN_DATA]
+         << " data_miss " << dyn_tmis[DYN_DATA]
+         << " transl_acc " << dyn_tot[DYN_TRANSL]
+         << " transl_miss " << dyn_tmis[DYN_TRANSL] << endl;
+    cout << NAME << " DYN AGE ROUNDS " << dyn_age_rounds << endl;
+    cout << NAME << " DYN PSEL final " << dyn_psel << " mid " << DYN_PSEL_MID << endl;
+}
