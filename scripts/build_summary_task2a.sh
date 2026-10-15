@@ -1,4 +1,10 @@
 #!/bin/bash
+# Build Summary_Task2a.pdf from the run logs.
+#   1. scripts/build_summary_task2a.py regenerates docs/summary/task2a.md,
+#      computing every figure from results/task2a/*.txt -- so the document
+#      cannot disagree with the logs it describes.
+#   2. pandoc renders it with pdflatex.
+# Task 1's Summary.pdf is a separate, finished artifact and is never touched.
 set -eu
 cd "$(dirname "$0")/.."
 

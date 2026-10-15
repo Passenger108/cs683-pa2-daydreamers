@@ -79,6 +79,7 @@ def chart(key, title, ylabel, fname, agg, baseline_at=None):
         ax.axhline(baseline_at, color='black', lw=0.9, ls='--', zorder=0)
         ax.annotate('no change', (len(labels) - 0.45, baseline_at),
                     fontsize=7, va='bottom', ha='right')
+        # a ratio chart is unreadable from 0; start just below the smallest bar
         allv = [float(rows[k][key]) for k in rows if key in rows[k] and rows[k][key] != '']
         if allv:
             ax.set_ylim(min(min(allv), baseline_at) * 0.985, max(allv) * 1.015)
