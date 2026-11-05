@@ -1,124 +1,54 @@
 #include "cache.h"
 
-#ifndef DYN_MAX_RRPV
-#define DYN_MAX_RRPV 3
-#endif
+/* ---------------- Parameters ---------------- */
+#define DYN_MAX_RRPV     3      // 2-bit RRPV: 0 (keep) .. 3 (evict)
+#define DYN_NUM_LEADERS  8      // leader sets per policy
+#define DYN_WINDOW       8192   // re-decide the mode every 8192 L2 loads
+#define DYN_INSTR_WEIGHT 2      // an instruction miss counts double in PSEL
+#define DYN_PF_INSERT    DYN_MAX_RRPV  // Task 3: RRPV given to a prefetched fill
 
-
-#ifndef DYN_SELECTOR
-#define DYN_SELECTOR 2
-#endif
-#define DYN_SEL_PDF   0
-#define DYN_SEL_HIT   1
-#define DYN_SEL_PSEL  2
-
-
-#ifndef DYN_THRESH_PCT
-#define DYN_THRESH_PCT 45
-#endif
-
-
-#ifndef DYN_HYST_PCT
-#define DYN_HYST_PCT 3
-#endif
-
-
-#ifndef DYN_NUM_LEADERS
-#define DYN_NUM_LEADERS 8
-#endif
-
-
-#ifndef DYN_WINDOW
-#define DYN_WINDOW 8192
-#endif
-
-
-#ifndef DYN_INSTR_WEIGHT
-#define DYN_INSTR_WEIGHT 2
-#endif
-
-
-#ifndef DYN_SPP_AWARE
-#define DYN_SPP_AWARE 1
-#endif
-
-
-#ifndef DYN_PF_INSERT
-#define DYN_PF_INSERT DYN_MAX_RRPV
-#endif
-
-
-#define DYN_PSEL_BITS 10
-#define DYN_PSEL_MAX  ((1u << DYN_PSEL_BITS) - 1u)
-#define DYN_PSEL_MID  (1u << (DYN_PSEL_BITS - 1))
-
-/* Keep invalid experiments from silently producing misleading results. */
-static_assert(DYN_MAX_RRPV >= 3 && DYN_MAX_RRPV <= 7,
-              "DYN_MAX_RRPV must be 3..7: at 1 the two modes collapse into one policy");
-static_assert(DYN_SELECTOR >= 0 && DYN_SELECTOR <= 2, "DYN_SELECTOR is 0, 1 or 2");
-static_assert(DYN_THRESH_PCT >= 0 && DYN_THRESH_PCT <= 100 &&
-              DYN_HYST_PCT >= 0 && DYN_HYST_PCT <= 25,
-              "DYN_THRESH_PCT is 0..100 and DYN_HYST_PCT is 0..25 percentage points");
-static_assert(DYN_NUM_LEADERS >= 1 && DYN_NUM_LEADERS <= L2C_SET / 4 &&
-              (L2C_SET % DYN_NUM_LEADERS) == 0,
-              "DYN_NUM_LEADERS must divide L2C_SET and leave most of the cache as followers");
-static_assert(DYN_WINDOW >= 256, "DYN_WINDOW below 256 decides on noise");
-static_assert(DYN_INSTR_WEIGHT >= 1 && DYN_INSTR_WEIGHT <= 8, "DYN_INSTR_WEIGHT is 1..8");
-static_assert(DYN_SPP_AWARE == 0 || DYN_SPP_AWARE == 1, "DYN_SPP_AWARE is 0 or 1");
-static_assert(DYN_PF_INSERT >= 0 && DYN_PF_INSERT <= DYN_MAX_RRPV,
-              "DYN_PF_INSERT is an RRPV, 0..DYN_MAX_RRPV");
-
-
-
-uint8_t  dyn_rrpv[L2C_SET][L2C_WAY];
-uint8_t  dyn_mode;
-uint32_t dyn_psel;
-uint64_t dyn_acc[3], dyn_mis[3];
-uint64_t dyn_tot[3], dyn_tmis[3];
-uint64_t dyn_ctr;
-uint64_t dyn_windows, dyn_win_irrip, dyn_switches, dyn_age_rounds;
-uint64_t dyn_ins[3], dyn_pro[3];
-uint64_t dyn_pf_ins, dyn_pf_useful;
+#define DYN_PSEL_MAX  1023      // 10-bit saturating counter
+#define DYN_PSEL_MID  512       // 512 = no preference
 
 #define DYN_MODE_RRIP  0
 #define DYN_MODE_IRRIP 1
+
 #define DYN_TRANSL 0
 #define DYN_INSTR  1
 #define DYN_DATA   2
 
-
-#define DYN_STRIDE (L2C_SET / DYN_NUM_LEADERS)
-#define DYN_FOLLOWER 0
-#define DYN_LEAD_RRIP 1
+#define DYN_STRIDE     (L2C_SET / DYN_NUM_LEADERS)   // 1024 / 8 = 128
+#define DYN_FOLLOWER   0
+#define DYN_LEAD_RRIP  1
 #define DYN_LEAD_IRRIP 2
 
-/* A few sets run fixed policies so the rest of the cache can learn which one wins. */
+/* ---------------- State ---------------- */
+uint8_t  dyn_rrpv[L2C_SET][L2C_WAY];   // RRPV of every L2 line
+uint8_t  dyn_mode;                     // mode the follower sets use now
+uint32_t dyn_psel;                     // set-dueling score counter
+uint64_t dyn_ctr;                      // L2 loads seen in the current window
+
+/* In every block of 128 sets: set 0 always runs I-RRIP, set 64 always runs RRIP. */
 static inline int dyn_role(uint32_t set)
 {
-#if DYN_SELECTOR == DYN_SEL_PSEL
-
     uint32_t r = set % DYN_STRIDE;
     if (r == 0)              return DYN_LEAD_IRRIP;
     if (r == DYN_STRIDE / 2) return DYN_LEAD_RRIP;
     return DYN_FOLLOWER;
-#else
-    return ((set % DYN_STRIDE) == 0) ? DYN_LEAD_RRIP : DYN_FOLLOWER;
-#endif
 }
 
+/* Leaders keep their fixed policy; followers use the current winner. */
 static inline int dyn_mode_of(uint32_t set)
 {
     int r = dyn_role(set);
-    /* Leader sets never follow the current decision. */
     if (r == DYN_LEAD_RRIP)  return DYN_MODE_RRIP;
     if (r == DYN_LEAD_IRRIP) return DYN_MODE_IRRIP;
     return dyn_mode;
 }
 
-
+/* Translation, instruction or data line. */
 static inline int dyn_class(uint32_t type, uint8_t isInstruction)
 {
-    /* Translation traffic is data in the cache, even when caused by an instruction. */
     if (type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION || type == TRANSLATION_FROM_L1D)
         return DYN_TRANSL;
     if ((type == LOAD || type == PREFETCH) && isInstruction)
@@ -126,99 +56,46 @@ static inline int dyn_class(uint32_t type, uint8_t isInstruction)
     return DYN_DATA;
 }
 
+/* Insertion: RRIP puts every new line at 2; I-RRIP puts instructions at 0, the rest at 3. */
 static inline uint8_t dyn_insert_rrpv(int mode, int cls, int pf)
 {
-#if DYN_SPP_AWARE
-    /* Do not protect speculative lines until a demand actually uses them. */
-    if (pf) return DYN_PF_INSERT;
-#else
-    (void)pf;
-#endif
+    if (pf) return DYN_PF_INSERT;   // Task 3: a prefetched line is not protected until a demand uses it
     if (mode == DYN_MODE_RRIP) return DYN_MAX_RRPV - 1;
     return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
 }
 
+/* Promotion: RRIP moves any hit to 0; I-RRIP moves only instruction hits to 0. */
 static inline uint8_t dyn_promote_rrpv(int mode, int cls)
 {
     if (mode == DYN_MODE_RRIP) return 0;
     return (cls == DYN_INSTR) ? 0 : DYN_MAX_RRPV;
 }
 
-
-static inline int dyn_threshold_mode(uint64_t num, uint64_t den, int cur)
-{
-    if (den == 0) return cur;
-    /* Hysteresis prevents small changes in a window from flipping modes repeatedly. */
-    int bar = (cur == DYN_MODE_IRRIP) ? (DYN_THRESH_PCT - DYN_HYST_PCT)
-                                      : (DYN_THRESH_PCT + DYN_HYST_PCT);
-    if (bar < 0) bar = 0; else if (bar > 100) bar = 100;
-    return (num * 100ULL > (uint64_t)bar * den) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
-}
-
+/* End of a window: low PSEL means I-RRIP leaders missed less, so followers use I-RRIP. */
 static void dyn_end_of_window(void)
 {
-    int next = dyn_mode;
-    dyn_windows++;
+    dyn_mode = (dyn_psel < DYN_PSEL_MID) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
 
-    /* Choose a mode only after enough accesses have accumulated for a useful signal. */
-#if DYN_SELECTOR == DYN_SEL_PDF
-
-    {
-        uint64_t ia = dyn_acc[DYN_INSTR], im = dyn_mis[DYN_INSTR];
-        uint64_t ta = ia + dyn_acc[DYN_DATA] + dyn_acc[DYN_TRANSL];
-        uint64_t tm = im + dyn_mis[DYN_DATA] + dyn_mis[DYN_TRANSL];
-        next = dyn_threshold_mode(ia + im, ta + tm, dyn_mode);
-    }
-#elif DYN_SELECTOR == DYN_SEL_HIT
-
-    next = dyn_threshold_mode(dyn_acc[DYN_INSTR] - dyn_mis[DYN_INSTR],
-                              dyn_acc[DYN_INSTR], dyn_mode);
-#else
-    next = (dyn_psel < DYN_PSEL_MID) ? DYN_MODE_IRRIP : DYN_MODE_RRIP;
-#endif
-
-    if (next != dyn_mode) dyn_switches++;
-    dyn_mode = next;
-    if (dyn_mode == DYN_MODE_IRRIP) dyn_win_irrip++;
-
-    /* Keep recent history, while gradually forgetting old workload phases. */
-    for (int c = 0; c < 3; c++) { dyn_acc[c] >>= 1; dyn_mis[c] >>= 1; }
+    /* Pull PSEL halfway back to the middle so old phases fade out. */
     dyn_psel = (uint32_t)((int)DYN_PSEL_MID + ((int)dyn_psel - (int)DYN_PSEL_MID) / 2);
 }
 
 void CACHE::l2c_initialize_replacement()
 {
-    /* Start neutral so the first window does not assume instruction priority. */
+    cout << "Initialize Dynamic I-RRIP state for L2C" << endl;
+
     for (int i = 0; i < L2C_SET; i++)
         for (int j = 0; j < L2C_WAY; j++)
-            dyn_rrpv[i][j] = DYN_MAX_RRPV;
+            dyn_rrpv[i][j] = DYN_MAX_RRPV;   // empty cache: every way evictable
 
-
-    dyn_mode = DYN_MODE_RRIP;
+    dyn_mode = DYN_MODE_RRIP;   // start with plain RRIP until there is evidence
     dyn_psel = DYN_PSEL_MID;
-    for (int c = 0; c < 3; c++) { dyn_acc[c] = 0; dyn_mis[c] = 0; dyn_tot[c] = 0; dyn_tmis[c] = 0; }
-    dyn_ctr = dyn_windows = dyn_win_irrip = dyn_switches = dyn_age_rounds = 0;
-    for (int c = 0; c < 3; c++) { dyn_ins[c] = 0; dyn_pro[c] = 0; }
-    dyn_pf_ins = dyn_pf_useful = 0;
-
-    cout << NAME << " DYN-IRRIP config"
-         << "  MAX_RRPV " << DYN_MAX_RRPV
-         << " | SELECTOR " << DYN_SELECTOR
-         << " thresh " << DYN_THRESH_PCT
-         << " hyst " << DYN_HYST_PCT
-         << " | LEADERS " << DYN_NUM_LEADERS
-         << " stride " << DYN_STRIDE
-         << " | WINDOW " << DYN_WINDOW
-         << " | INSTR_WEIGHT " << DYN_INSTR_WEIGHT
-         << " | SPP_AWARE " << DYN_SPP_AWARE
-         << " PF_INSERT " << DYN_PF_INSERT
-         << endl;
+    dyn_ctr  = 0;
 }
 
-
+/* Eviction: unchanged RRIP search. Take a line at max RRPV, else age the set and retry. */
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
-    /* Standard RRIP victim selection: age the set until one line reaches its limit. */
     while (1)
     {
         for (int i = 0; i < L2C_WAY; i++)
@@ -226,12 +103,10 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
                 return i;
         for (int i = 0; i < L2C_WAY; i++)
             dyn_rrpv[set][i]++;
-        dyn_age_rounds++;
     }
     assert(0);
     return 0;
 }
-
 
 void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
 {
@@ -243,83 +118,31 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     int mode = dyn_mode_of(set);
     int pf   = (type == PREFETCH);
 
-    /* Count a prefetched line as useful only when a demand load hits it. */
-    if (hit && type == LOAD && block[set][way].prefetch) dyn_pf_useful++;
-
+    /* Set dueling: only demand loads are scored. */
     if (type == LOAD)
     {
-        /* RRIP leader traffic is the unbiased sample used by the selector. */
-        if (role == DYN_LEAD_RRIP)
-        {
-            dyn_acc[cls]++;
-            if (!hit) dyn_mis[cls]++;
-            dyn_tot[cls]++;
-            if (!hit) dyn_tmis[cls]++;
-        }
-
-#if DYN_SELECTOR == DYN_SEL_PSEL
-    /* Misses push the selector toward the policy whose leaders performed better. */
         if (!hit)
         {
             int w = (cls == DYN_INSTR) ? DYN_INSTR_WEIGHT : 1;
-            int d = (role == DYN_LEAD_IRRIP) ? +w : (role == DYN_LEAD_RRIP ? -w : 0);
+            int d = 0;
+            if (role == DYN_LEAD_IRRIP) d = +w;   // I-RRIP leader missed
+            if (role == DYN_LEAD_RRIP)  d = -w;   // RRIP leader missed
             int v = (int)dyn_psel + d;
-            dyn_psel = (uint32_t)(v < 0 ? 0 : (v > (int)DYN_PSEL_MAX ? (int)DYN_PSEL_MAX : v));
+            if (v < 0) v = 0;
+            if (v > (int)DYN_PSEL_MAX) v = DYN_PSEL_MAX;
+            dyn_psel = (uint32_t)v;
         }
-#endif
+
         if (++dyn_ctr >= DYN_WINDOW) { dyn_end_of_window(); dyn_ctr = 0; }
     }
 
-    /* Hits promote a line; misses insert it at the depth chosen by the active policy. */
-    if (hit) { dyn_rrpv[set][way] = dyn_promote_rrpv(mode, cls); dyn_pro[cls]++; }
-    else {
-        dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls, pf);
-        dyn_ins[cls]++;
-        if (pf) dyn_pf_ins++;
-    }
+    if (hit)
+        dyn_rrpv[set][way] = dyn_promote_rrpv(mode, cls);       // promotion
+    else
+        dyn_rrpv[set][way] = dyn_insert_rrpv(mode, cls, pf);    // insertion
 }
 
 void CACHE::l2c_replacement_final_stats()
 {
-    /* Report behavior and the extra state cost of making the policy dynamic. */
-    int rrpv_bits = 1;
-    while ((1 << rrpv_bits) - 1 < DYN_MAX_RRPV) rrpv_bits++;
-    long rrpv_total = (long)L2C_SET * L2C_WAY * rrpv_bits;
 
-
-    int cb = 1;
-    while ((1L << cb) < (long)DYN_WINDOW) cb++;
-    long sel_total = 5L * cb + DYN_PSEL_BITS + 1;
-
-    cout << NAME << " DYN MODE windows " << dyn_windows
-         << " in_irrip " << dyn_win_irrip
-         << " pct_irrip " << (dyn_windows ? (100.0 * dyn_win_irrip / dyn_windows) : 0.0)
-         << " switches " << dyn_switches << endl;
-    cout << NAME << " DYN PSEL final " << dyn_psel << " mid " << DYN_PSEL_MID << endl;
-
-    cout << NAME << " DYN COUNTERS instr_acc " << dyn_tot[DYN_INSTR]
-         << " instr_miss " << dyn_tmis[DYN_INSTR]
-         << " data_acc " << dyn_tot[DYN_DATA]
-         << " data_miss " << dyn_tmis[DYN_DATA]
-         << " transl_acc " << dyn_tot[DYN_TRANSL]
-         << " transl_miss " << dyn_tmis[DYN_TRANSL] << endl;
-    cout << NAME << " DYN INSERTS instr " << dyn_ins[DYN_INSTR]
-         << " data " << dyn_ins[DYN_DATA] << " transl " << dyn_ins[DYN_TRANSL] << endl;
-    cout << NAME << " DYN PROMOTES instr " << dyn_pro[DYN_INSTR]
-         << " data " << dyn_pro[DYN_DATA] << " transl " << dyn_pro[DYN_TRANSL] << endl;
-    cout << NAME << " DYN LEADERS per_group " << DYN_NUM_LEADERS << " of " << L2C_SET
-         << " sacrificed_pct "
-         << (100.0 * DYN_NUM_LEADERS * ((DYN_SELECTOR == DYN_SEL_PSEL) ? 2 : 1) / L2C_SET) << endl;
-    cout << NAME << " DYN PREFETCH aware " << DYN_SPP_AWARE
-         << " pf_insert_rrpv " << DYN_PF_INSERT
-         << " pf_inserts " << dyn_pf_ins
-         << " pf_useful_at_l2 " << dyn_pf_useful
-         << " pf_hit_rate " << (dyn_pf_ins ? (100.0 * dyn_pf_useful / dyn_pf_ins) : 0.0)
-         << endl;
-    cout << NAME << " DYN AGE ROUNDS " << dyn_age_rounds << endl;
-    cout << NAME << " DYN STORAGE rrpv_bits_per_line " << rrpv_bits
-         << " rrpv_bits " << rrpv_total
-         << " selector_bits " << sel_total
-         << " total_bits " << (rrpv_total + sel_total)
-         << " total_bytes " << ((rrpv_total + sel_total + 7) / 8) << endl;
 }
